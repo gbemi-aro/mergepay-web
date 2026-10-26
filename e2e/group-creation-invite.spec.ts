@@ -276,12 +276,16 @@ async function goToGroups(page: Page) {
   await expect(page).toHaveURL(/\/groups$/);
 }
 
-/** Create a group through the dialog and wait for the detail page. */
-async function createGroup(page: Page, name: string, description: string) {
+/** Fill in and submit the create-group dialog. */
+async function submitGroup(page: Page, name: string, description: string) {
   const dialog = page.getByRole("dialog", { name: "New group" });
   await dialog.getByLabel("Group name").fill(name);
   await dialog.getByLabel("Description (optional)").fill(description);
   await dialog.getByRole("button", { name: "Create group" }).click();
+}
+
+/** Wait until the router has landed on the new group's detail page. */
+async function expectGroupDetailUrl(page: Page) {
   await expect(page).toHaveURL(new RegExp(`/groups/${GROUP_ID}(\\?.*)?$`));
 }
 
@@ -301,13 +305,15 @@ test("creates an expense group and navigates to its detail page", async ({ page 
   const dialog = page.getByRole("dialog", { name: "New group" });
   await expect(dialog).toBeVisible();
 
-  await createGroup(page, "Lagos Trip 2026", "Shared spending for the October trip");
+  await submitGroup(page, "Lagos Trip 2026", "Shared spending for the October trip");
 
-  // Success feedback is a transient toast — assert it before it auto-dismisses.
+  // Success feedback is a transient sonner toast (4s). Assert it first, right
+  // after the mutation resolves: waiting on the client-side navigation below
+  // can outlive the toast when the route still has to compile.
   await expect(page.getByText("Group created")).toBeVisible();
 
   // Navigation update: we are on the new group's page, not the list.
-  await expect(page).toHaveURL(new RegExp(`/groups/${GROUP_ID}(\\?.*)?$`));
+  await expectGroupDetailUrl(page);
   await expect(page.getByRole("heading", { level: 1, name: "Lagos Trip 2026" })).toBeVisible();
   await expect(page.getByText("Shared spending for the October trip")).toBeVisible();
   await expect(page.getByRole("button", { name: /add expense/i })).toBeVisible();
@@ -327,11 +333,13 @@ test("generates a member invite and shows the new group in the list", async ({ p
   await signIn(page);
   await goToGroups(page);
   await page.getByRole("button", { name: "Create group" }).click();
-  await createGroup(page, "Lagos Trip 2026", "Shared spending for the October trip");
+  await submitGroup(page, "Lagos Trip 2026", "Shared spending for the October trip");
+  await expectGroupDetailUrl(page);
 
-  // Open the invite dialog from the group page.
+  // Open the invite dialog from the group page. Its title is
+  // "Invite to <group name>", so match on the leading word only.
   await page.getByRole("button", { name: "Invite", exact: true }).click();
-  const inviteDialog = page.getByRole("dialog", { name: "Invite members" });
+  const inviteDialog = page.getByRole("dialog", { name: /^Invite/ });
   await expect(inviteDialog).toBeVisible();
 
   await inviteDialog.getByRole("button", { name: "Generate invite" }).click();
