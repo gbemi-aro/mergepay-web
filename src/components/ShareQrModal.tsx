@@ -1,6 +1,6 @@
 "use client";
 
-import { QRCodeCanvas } from "qrcode.react";
+import { QRCodeCanvas } from "@/components/ui/lazy-qr-code";
 import { Copy, Check, QrCode, Camera, ArrowRight } from "lucide-react";
 import { useState } from "react";
 import { useRouter } from "next/navigation";

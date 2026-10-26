@@ -49,6 +49,7 @@ describe("findAnchorForAsset", () => {
     const named = findAnchorForAsset(anchors, "USDC", "FiatOnRamp");
     assert.ok(named);
     // FiatOnRamp does not support USDC, so the fallback wins.
+    assert.ok(named);
     assert.strictEqual(named.name, "TestAnchor");
   });
 

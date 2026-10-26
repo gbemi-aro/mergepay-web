@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { QRCodeSVG } from "qrcode.react";
+import { QRCodeSVG } from "@/components/ui/lazy-qr-code";
 import { Share2 } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";

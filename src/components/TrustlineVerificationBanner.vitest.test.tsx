@@ -70,6 +70,10 @@ describe("TrustlineVerificationBanner", () => {
       // fetched balances show every required trustline in place.
       expect(container.querySelector('[role="alert"]')).toBeNull();
     });
+    // Wait for the balances query to resolve and the banner to unmount.
+    await waitFor(() => {
+      expect(container.querySelector('[role="alert"]')).toBeNull();
+    });
   });
 
   it("renders an alert banner listing missing trustline assets", async () => {

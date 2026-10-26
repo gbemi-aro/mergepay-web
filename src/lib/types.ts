@@ -19,7 +19,7 @@ export type StellarNetwork = "testnet" | "public";
 export type Role = "admin" | "member" | "viewer";
 export type SplitType = "equal" | "custom" | "percentage";
 export type ShareStatus = "pending" | "settling" | "settled";
-export type SettlementStatus = "pending" | "submitted" | "confirmed" | "failed";
+export type SettlementStatus = "pending" | "submitted" | "settling" | "confirmed" | "failed";
 export type TreasuryDirection = "deposit" | "withdrawal";
 export type TreasuryTxStatus =
   | "pending"
@@ -452,12 +452,26 @@ export interface AnchorSession {
   createdAt: string;
 }
 
-export interface AnchorDepositRequest {
+/**
+ * Values a SEP-24 start request can prefill on the anchor's interactive
+ * page. All optional: an anchor collects anything that is missing itself.
+ * Validated client-side by `src/lib/validations/anchor.ts` before submission.
+ */
+export interface AnchorTransferPrefill {
+  /** Transfer amount as a plain decimal string (e.g. "12.5"). */
+  amount?: string;
+  /** Stellar account the anchor should fund (deposit) or pay out (withdrawal). */
+  destination?: string;
+  /** Text memo attached to the transfer (max 28 bytes on Stellar). */
+  memo?: string;
+}
+
+export interface AnchorDepositRequest extends AnchorTransferPrefill {
   assetCode: string;
   anchorName?: string;
 }
 
-export interface AnchorWithdrawRequest {
+export interface AnchorWithdrawRequest extends AnchorTransferPrefill {
   assetCode: string;
   anchorName?: string;
 }
@@ -487,6 +501,33 @@ export interface AnchorSessionsResponse {
   sessions: AnchorSession[];
 }
 
+/**
+ * How an anchor's SEP-24 interactive UI is presented.
+ *
+ * Anchors that forbid framing (`frame-ancestors` / `X-Frame-Options`) must
+ * be opened in a popup window instead of an inline iframe.
+ */
+export type AnchorInteractiveMode = "iframe" | "popup";
+
+/**
+ * Resolved SEP-24 interactive details for a started transfer.
+ *
+ * Built from the session returned by `POST /anchors/sessions/:id/complete`
+ * after the wallet signs the anchor's SEP-10 challenge. The modal renders the
+ * anchor-hosted transaction URL and any customer/KYC fields the anchor
+ * requires before the transfer can settle.
+ */
+export interface AnchorInteractiveInfo {
+  /** The underlying SEP-24 session (source of truth for status). */
+  session: AnchorSession;
+  /** Anchor-hosted transfer/KYC URL, or `null` when not issued / not https. */
+  interactiveUrl: string | null;
+  /** Preferred presentation mode for the interactive URL. */
+  mode: AnchorInteractiveMode;
+  /** Customer/KYC fields the anchor reports as required, if any. */
+  customerFields: string[];
+}
+
 // ---------------------------------------------------------------------------
 // History & uploads
 // ---------------------------------------------------------------------------
@@ -513,6 +554,12 @@ export interface ConfiguredAsset {
   name?: string;
 }
 
+/**
+ * Asset codes the app can settle in. XLM is the native asset; USDC is the
+ * supported issued asset (see `SETTLEMENT_ASSETS` in `src/lib/constants.ts`).
+ */
+export type SettlementAssetCode = "XLM" | "USDC";
+
 export interface HorizonBalanceItem {
   asset_type: string;
   balance: string;
@@ -528,6 +575,21 @@ export interface TrustlineAsset {
   balance: string;
   hasTrustline: boolean;
   limit?: string;
+}
+
+export interface AssetTrustlineWidgetProps {
+  /** Optional connected account public key. Falls back to active auth/wallet key. */
+  publicKey?: string;
+  /** Assets to inspect and verify. Defaults to SETTLEMENT_ASSETS (XLM, USDC). */
+  requiredAssets?: ConfiguredAsset[];
+  /** Minimum balance thresholds required for each asset. */
+  minimumBalances?: Record<string, string | number>;
+  /** Callback fired when a trustline is successfully added through the widget. */
+  onTrustlineAdded?: (assetCode: string) => void;
+  /** Optional container CSS class. */
+  className?: string;
+  /** Whether to render in compact presentation mode. */
+  compact?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +618,7 @@ export interface GroupActivityEvent {
   assetCode?: string;
   timestamp: string;
   isOptimistic?: boolean;
+  status?: SettlementStatus;
   metadata?: Record<string, unknown>;
 }
 

@@ -359,14 +359,20 @@ describe("expenseFormSchema — percentage split", () => {
 // ---------------------------------------------------------------------------
 
 describe("expenseFormSchema — memo", () => {
-  it("caps the memo length at 28 characters", () => {
-    assert.equal(parse({ memo: "A".repeat(29) }).success, false);
-    assert.equal(parse({ memo: "A".repeat(28) }).success, true);
+  it("caps the memo at the 28-byte Stellar limit", () => {
+    // "MP:" is 3 bytes, leaving 25 for the reconciliation code.
+    assert.equal(parse({ memo: `MP:${"a".repeat(25)}` }).success, true);
+    assert.equal(parse({ memo: `MP:${"a".repeat(26)}` }).success, false);
   });
 
   it("rejects control characters", () => {
     assert.equal(parse({ memo: "bad\u0000memo" }).success, false);
     assert.equal(parse({ memo: "bad\u001fmemo" }).success, false);
+  });
+
+  it("requires the MP: prefix when a memo is supplied", () => {
+    assert.equal(parse({ memo: "dinner-1a2b" }).success, false);
+    assert.equal(parse({ memo: "MP:dinner-1a2b" }).success, true);
   });
 });
 
@@ -392,5 +398,51 @@ describe("expenseFormSchema — issue paths", () => {
     });
     assert.equal(result.success, false);
     assert.equal(result.error?.issues[0]?.path[0], "shares");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Consistency with the submit gate and exact percentage arithmetic
+// ---------------------------------------------------------------------------
+
+describe("expenseFormSchema — Stellar amount ceiling", () => {
+  it("accepts the largest amount Stellar can represent", () => {
+    assert.equal(parse({ amount: "922337203685.4775807", shares: [{ userId: "user-a" }] }).success, true);
+  });
+
+  it("flags an amount above the int64 stroop ceiling inline, not only at submit", () => {
+    for (const amount of ["922337203685.4775808", "999999999999999"]) {
+      const result = parse({ amount, shares: [{ userId: "user-a" }] });
+      assert.equal(result.success, false, amount);
+      assert.equal(result.error?.issues[0]?.path[0], "amount");
+      assert.match(result.error?.issues[0]?.message ?? "", /exceeds the maximum supported by Stellar/);
+    }
+  });
+});
+
+describe("expenseFormSchema — percentage sums are exact", () => {
+  it("reports the sum without float noise", () => {
+    const result = parse({
+      ...validPercentage,
+      shares: [
+        { userId: "user-a", percent: 10.1 },
+        { userId: "user-b", percent: 20.2 },
+      ],
+    });
+    assert.equal(result.success, false);
+    const message = result.error?.issues.find((i) => i.path[0] === "shares")?.message ?? "";
+    assert.equal(message, "Percentages add up to 30.3% — they must add up to 100%");
+  });
+
+  it("accepts percentages that only sum to 100 under exact arithmetic", () => {
+    const result = parse({
+      ...validPercentage,
+      shares: [
+        { userId: "user-a", percent: 33.33 },
+        { userId: "user-b", percent: 33.33 },
+        { userId: "user-c", percent: 33.34 },
+      ],
+    });
+    assert.equal(result.success, true);
   });
 });

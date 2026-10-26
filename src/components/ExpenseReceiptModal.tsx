@@ -14,7 +14,7 @@
 
 import { useState } from "react";
 import { Check, Copy, ExternalLink, FileText, Share2 } from "lucide-react";
-import { QRCodeCanvas } from "qrcode.react";
+import { QRCodeCanvas } from "@/components/ui/lazy-qr-code";
 import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";

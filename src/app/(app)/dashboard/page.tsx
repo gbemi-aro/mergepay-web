@@ -4,26 +4,44 @@ import { useAuth } from "@/hooks/useAuth";
 import { useGroups } from "@/lib/queries";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Plus, Users, ArrowRight } from "lucide-react";
+import {
+  Plus,
+  Users,
+  ArrowRight,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Banknote,
+} from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { CreateGroupDialog } from "@/components/groups/create-group-dialog";
 import { JoinGroupDialog } from "@/components/groups/join-group-dialog";
+import { Sep24Modal } from "@/components/anchors/Sep24Modal";
 import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { GroupBudgetTracker } from "@/components/GroupBudgetTracker";
-import type { Group } from "@/lib/types";
+import { TreasuryBalanceWidget } from "@/components/treasury/TreasuryBalanceWidget";
+import type { AnchorSessionKind, Group } from "@/lib/types";
+import { GroupListSkeleton } from "@/components/groups/GroupListSkeleton";
 
 export default function DashboardPage() {
   const { user } = useAuth();
   const { data, isLoading, error, refetch } = useGroups();
   const [createOpen, setCreateOpen] = useState(false);
   const [joinOpen, setJoinOpen] = useState(false);
+  // SEP-24 on/off-ramp (#374) — opened from the fiat ramp card below.
+  const [rampOpen, setRampOpen] = useState(false);
+  const [rampKind, setRampKind] = useState<AnchorSessionKind>("deposit");
+
+  function openRamp(kind: AnchorSessionKind) {
+    setRampKind(kind);
+    setRampOpen(true);
+  }
 
   const groups = data?.groups ?? [];
 
   return (
     <ErrorBoundary onReset={() => refetch()}>
-      <div className="space-y-6">
+<div className="space-y-6 max-w-full box-border overflow-x-hidden px-1 sm:px-0">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h1 className="font-display text-2xl uppercase tracking-tight">
@@ -43,11 +61,44 @@ export default function DashboardPage() {
           </div>
         </div>
 
+        {/* Treasury Mode balances & trustlines (#344) */}
+        <ErrorBoundary>
+          <TreasuryBalanceWidget />
+        </ErrorBoundary>
+
+        {/* SEP-24 fiat on/off-ramp (#374) */}
+<Card className="border-3 border-ink bg-lime-pale p-4 sm:p-5 max-w-full box-border overflow-hidden">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-10 w-10 items-center justify-center rounded-xl border-2 border-ink bg-tangerine">
+                <Banknote className="h-5 w-5" />
+              </span>
+              <div>
+                <p className="font-display text-sm uppercase tracking-tight">
+                  Fiat on/off-ramp
+                </p>
+                <p className="text-xs text-ink/60">
+                  Fund your account with USDC or cash out to your bank through a
+                  SEP-24 anchor.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => openRamp("deposit")}>
+                <ArrowDownToLine className="h-4 w-4" /> Add money
+              </Button>
+              <Button variant="outline" onClick={() => openRamp("withdrawal")}>
+                <ArrowUpFromLine className="h-4 w-4" /> Withdraw
+              </Button>
+            </div>
+          </div>
+        </Card>
+
         <ErrorBoundary>
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {isLoading && (
-              <div className="col-span-full py-12 text-center text-sm text-ink/60">
-                Loading your groups...
+              <div className="col-span-full">
+                <GroupListSkeleton count={3} />
               </div>
             )}
             {error && (
@@ -106,6 +157,11 @@ export default function DashboardPage() {
 
         <CreateGroupDialog open={createOpen} onClose={() => setCreateOpen(false)} />
         <JoinGroupDialog open={joinOpen} onClose={() => setJoinOpen(false)} />
+        <Sep24Modal
+          open={rampOpen}
+          defaultKind={rampKind}
+          onClose={() => setRampOpen(false)}
+        />
       </div>
     </ErrorBoundary>
   );
