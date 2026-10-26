@@ -1,6 +1,7 @@
 "use client";
 
 import { MutationCache, QueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { ApiRequestError, ApiValidationError, isSessionExpired } from "./api";
 
 /**
@@ -43,7 +44,15 @@ export const DEFAULT_RETRY_COUNT = 2;
  */
 export function createQueryClient(): QueryClient {
   const mutationCache = new MutationCache({
+    onMutate: () => {
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        toast.error("You are currently offline. Please reconnect before submitting changes.");
+      }
+    },
     onError: () => {
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        toast.error("Network unavailable. Your transaction could not be submitted.");
+      }
       // Leave mutations in a recoverable state while the browser is offline so
       // they can resume cleanly once connectivity returns. The app-level forms
       // already gate submit buttons when `navigator.onLine` is false.
@@ -56,10 +65,15 @@ export function createQueryClient(): QueryClient {
       queries: {
         staleTime: DEFAULT_STALE_TIME_MS,
         gcTime: DEFAULT_GC_TIME_MS,
-        // Revalidate stale queries when the user returns to the tab; fresh
-        // queries (within `staleTime`) are served from cache without a fetch.
-        refetchOnWindowFocus: true,
+        networkMode: "offlineFirst",
+        // Revalidate stale queries when the user returns to the tab while online;
+        // fresh queries (within `staleTime`) or offline state avoids futile network hits.
+        refetchOnWindowFocus: () => (typeof navigator !== "undefined" ? navigator.onLine : true),
         retry: (failureCount, error) => {
+          // Do not attempt automatic retries while device is offline
+          if (typeof navigator !== "undefined" && !navigator.onLine) {
+            return false;
+          }
           // Never retry once the session is gone — a login is required.
           if (isSessionExpired()) return false;
           // Client errors (4xx) are deterministic; retrying won't change them.

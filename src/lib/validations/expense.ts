@@ -1,8 +1,24 @@
 import { z } from "zod";
 
+import { isValidEd25519PublicKey } from "../strkey";
+import { MAX_STROOPS } from "../validation";
+import { mergepayMemoSchema } from "./memo";
+import {
+  FULL_PERCENT_BP,
+  calculateSplit,
+  formatBasisPoints,
+  parseAmountStroops,
+  parsePercentBasisPoints,
+  type SplitCalculation,
+} from "../split";
+
 /**
  * Comprehensive Zod schema for expense creation and split validation.
  * Enforces multi-field sum invariants using .refine()/.superRefine() to prevent rounding errors.
+ *
+ * Rules mirror the `CreateExpenseRequest` contract in `src/lib/types.ts`:
+ * decimal-string amounts, Stellar asset codes, an optional issuer public
+ * key, and a non-empty participant array.
  */
 export const expenseShareSchema = z.object({
   userId: z.string().trim().min(1, "Participant is required"),
@@ -30,6 +46,12 @@ function unitsToDecimal(units: bigint): string {
 /** Plain decimal amount (integer part + optional fraction), no sign/exponent. */
 const plainAmount = /^\d+(?:\.\d+)?$/;
 
+/**
+ * Stellar asset codes are 1–12 alphanumeric characters (XLM, USDC, …).
+ * Anything longer or containing symbols cannot exist on the network.
+ */
+const ASSET_CODE_PATTERN = /^[A-Za-z0-9]{1,12}$/;
+
 /** Exactly the "plain number" error family the UI copy promises. */
 const PLAIN_NUMBER = "Amount must be a plain number";
 const MAX_PRECISION = "Amount must have at most 7 decimal places";
@@ -41,13 +63,42 @@ export const expenseFormSchema = z
       .trim()
       .min(1, "Title is required")
       .max(80, "Title must be 80 characters or fewer"),
-    description: z.string().nullable().optional(),
+    description: z
+      .string()
+      .trim()
+      .max(500, "Description must be 500 characters or fewer")
+      .regex(/^[^\u0000-\u001f\u007f]*$/, "Description must not contain control characters")
+      .nullable()
+      .optional(),
     amount: z
       .string()
       .min(1, "Amount is required")
-      .regex(/^\d+(?:\.\d{1,7})?$/, `${PLAIN_NUMBER} with at most 7 decimal places`),
-    assetCode: z.string().min(1, "Asset code is required"),
-    assetIssuer: z.string().nullable().optional(),
+      .regex(/^\d+(?:\.\d{1,7})?$/, `${PLAIN_NUMBER} with at most 7 decimal places`) // strict positive decimal with up to 7 decimal places
+      .refine((val) => { const num = parseFloat(val); return !isNaN(num) && num > 0; }, "Amount must be greater than zero")
+      // The payload gate (`expenseCreationSchema`) rejects anything above the
+      // int64 stroop ceiling; enforce it here too so the field is flagged
+      // inline instead of failing only after submit.
+      .refine(
+        // Zod still runs this after the format check fails, so only measure
+        // amounts that are well-formed (BigInt throws on "abc").
+        (val) => !/^\d+(?:\.\d{1,7})?$/.test(val) || parseUnits(val) <= MAX_STROOPS,
+        "Amount exceeds the maximum supported by Stellar"
+      ),
+    assetCode: z
+      .string()
+      .trim()
+      .min(1, "Asset code is required")
+      .regex(ASSET_CODE_PATTERN, "Asset code must be 1-12 letters or digits"),
+    assetIssuer: z
+      .string()
+      .trim()
+      .refine(
+        (value) => value === "" || isValidEd25519PublicKey(value),
+        "Asset issuer must be a valid Stellar public key"
+      )
+      .transform((value) => (value === "" ? null : value))
+      .nullable()
+      .optional(),
     splitType: z.enum(["equal", "custom", "percentage"], {
       errorMap: () => ({ message: "Choose how to split this expense" }),
     }),
@@ -56,15 +107,30 @@ export const expenseFormSchema = z
       .string()
       .optional()
       .refine((value) => value === undefined || value.trim() !== "", "Choose who paid"),
-    memo: z
-      .string()
-      .max(28, "Memo must be 28 characters or fewer")
-      .regex(/^[^\u0000-\u001f\u007f]*$/, "Memo must not contain control characters")
-      .nullable()
-      .optional(),
+    // Optional, but when present it must be a well-formed `MP:<code>` memo.
+    // The character cap and the charset both come from `mergepayMemoSchema`,
+    // which also enforces the 28-*byte* Stellar limit (characters alone let a
+    // multi-byte memo through and get it rejected at submission instead).
+    memo: mergepayMemoSchema.nullable().optional(),
     receiptUrl: z.string().nullable().optional(),
   })
   .superRefine((data, ctx) => {
+    // Reject duplicate participants before summing shares: a repeated user
+    // id would otherwise double-count in custom/percentage splits.
+    const seen = new Set<string>();
+    for (let i = 0; i < data.shares.length; i++) {
+      const id = data.shares[i].userId;
+      if (seen.has(id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["shares"],
+          message: "A participant is selected more than once",
+        });
+        break;
+      }
+      seen.add(id);
+    }
+
     // Validate amount > 0
     try {
       const totalUnits = parseUnits(data.amount);
@@ -140,7 +206,9 @@ export const expenseFormSchema = z
           });
         }
       } else if (data.splitType === "percentage") {
-        let percentSum = 0;
+        // Summed in basis points (integers) so 10.1 + 20.2 is exactly 30.30,
+        // not 30.299999999999997.
+        let percentSumBp = 0;
         for (let i = 0; i < data.shares.length; i++) {
           const share = data.shares[i];
           if (share.percent === undefined || share.percent === null || isNaN(share.percent)) {
@@ -167,16 +235,14 @@ export const expenseFormSchema = z
             });
             continue;
           }
-          percentSum += share.percent;
+          percentSumBp += Math.round(share.percent * 100);
         }
 
-        // Check if percentages add up to 100 (allowing minor floating delta checks)
-        const roundedTotal = Math.round(percentSum * 100);
-        if (roundedTotal !== 10000) {
+        if (percentSumBp !== FULL_PERCENT_BP) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ["shares"],
-            message: `Percentages add up to ${percentSum}% — they must add up to 100%`,
+            message: `Percentages add up to ${formatBasisPoints(percentSumBp)}% — they must add up to 100%`,
           });
         }
       }
@@ -190,3 +256,107 @@ export const expenseFormSchema = z
   });
 
 export type ExpenseFormValues = z.infer<typeof expenseFormSchema>;
+
+// ---------------------------------------------------------------------------
+// Split calculator form (issue #353)
+// ---------------------------------------------------------------------------
+
+/**
+ * One participant row in the split calculator. Both inputs are kept as the
+ * raw strings the user typed; only the field for the active mode is checked.
+ */
+export const splitAllocationSchema = z.object({
+  userId: z.string().trim().min(1, "Participant is required"),
+  amount: z.string(),
+  percent: z.string(),
+});
+
+/**
+ * Validates the split calculator form used by React Hook Form. The expense
+ * total is part of the form values so the resolver can compare the rows
+ * against it; the sum checks reuse `calculateSplit`, which works in stroops
+ * and basis points so no rounding error can slip through.
+ */
+export const splitCalculatorSchema = z
+  .object({
+    totalAmount: z.string(),
+    mode: z.enum(["equal", "custom", "percentage"]),
+    allocations: z.array(splitAllocationSchema).min(1, "Select at least one participant"),
+  })
+  .superRefine((data, ctx) => {
+    const total = parseAmountStroops(data.totalAmount);
+    if (total === null || total <= 0n) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["totalAmount"],
+        message: "Enter the expense amount first",
+      });
+      return;
+    }
+
+    if (data.mode === "equal") {
+      if (total < BigInt(data.allocations.length)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["allocations"],
+          message: `Amount is too small to split between ${data.allocations.length} people`,
+        });
+      }
+      return;
+    }
+
+    data.allocations.forEach((row, i) => {
+      if (data.mode === "custom") {
+        const value = row.amount.trim();
+        if (value === "") {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["allocations", i, "amount"], message: "Enter an amount" });
+        } else if (!plainAmount.test(value)) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["allocations", i, "amount"], message: PLAIN_NUMBER });
+        } else if (parseAmountStroops(value) === null) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["allocations", i, "amount"], message: MAX_PRECISION });
+        }
+      } else {
+        const value = row.percent.trim();
+        if (value === "") {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["allocations", i, "percent"], message: "Enter a percentage" });
+        } else if (parsePercentBasisPoints(value) === null) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["allocations", i, "percent"],
+            message: "Use 0–100 with at most 2 decimals",
+          });
+        }
+      }
+    });
+
+    const calc = calculateSplit(data.mode, data.totalAmount, data.allocations);
+    if (calc.balance === "under" || calc.balance === "over") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["allocations"],
+        message: describeSplitImbalance(calc) ?? "Split does not add up",
+      });
+    }
+  });
+
+export type SplitCalculatorValues = z.infer<typeof splitCalculatorSchema>;
+
+/**
+ * Human copy for an unbalanced split, shared by the zod issue and the live
+ * warning banner so both always say the same thing. `null` when balanced.
+ */
+export function describeSplitImbalance(calc: SplitCalculation): string | null {
+  if (calc.balance !== "under" && calc.balance !== "over") return null;
+  if (calc.mode === "percentage") {
+    const sum = calc.percentTotalBp ?? 0;
+    const gap = Math.abs(FULL_PERCENT_BP - sum);
+    return `Percentages add up to ${formatBasisPoints(sum)}% — ${formatBasisPoints(gap)}% ${
+      calc.balance === "under" ? "left to assign" : "too much"
+    }. They must total 100%.`;
+  }
+  const total = calc.totalStroops ?? 0n;
+  const gap = calc.remainingStroops < 0n ? -calc.remainingStroops : calc.remainingStroops;
+  return `Amounts add up to ${unitsToDecimal(calc.allocatedStroops)} — ${unitsToDecimal(gap)} ${
+    calc.balance === "under" ? "left to assign" : "over"
+  }. They must total ${unitsToDecimal(total)}.`;
+}

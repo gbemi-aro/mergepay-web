@@ -6,20 +6,26 @@ import { Plus, Users, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { ErrorBoundary } from "@/components/ui/ErrorBoundary";
+import { GroupErrorBoundary } from "@/components/groups/GroupErrorBoundary";
 import { useGroups } from "@/lib/queries";
+import { orderGroupsByActive, useGroupStore } from "@/lib/group-store";
 import { CreateGroupDialog } from "@/components/groups/create-group-dialog";
 import { JoinGroupDialog } from "@/components/groups/join-group-dialog";
+import { ListSkeleton, GroupCardSkeleton } from "@/components/ui/skeleton";
+import { GroupListSkeleton } from "@/components/groups/GroupListSkeleton";
 
 export default function GroupsPage() {
   const { data, isLoading, refetch } = useGroups();
-  const groups = data?.groups ?? [];
+  // The group the user was last in is persisted, so a reload puts it back at
+  // the top of the list instead of making them hunt for it (#494).
+  const activeGroupId = useGroupStore((s) => s.selectedGroupId);
+  const groups = orderGroupsByActive(data?.groups ?? [], activeGroupId);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [joinOpen, setJoinOpen] = useState(false);
 
   return (
-    <ErrorBoundary onReset={() => refetch()}>
+    <GroupErrorBoundary onReset={() => refetch()}>
       <div className="space-y-6">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div>
@@ -34,21 +40,22 @@ export default function GroupsPage() {
             <Button variant="outline" onClick={() => setJoinOpen(true)}>
               <Users className="h-4 w-4" /> Join group
             </Button>
-            <Button onClick={() => setCreateOpen(true)}>
+            <Button
+              onClick={() => setCreateOpen(true)}
+              data-testid="groups-create"
+            >
               <Plus className="h-4 w-4" /> New group
             </Button>
           </div>
         </div>
 
         {isLoading ? (
-          <div className="text-center py-12 text-ink/60 font-mono text-sm">
-            Loading groups...
-          </div>
+          <GroupListSkeleton count={6} />
         ) : groups.length === 0 ? (
           <EmptyState
             icon={<Users className="h-8 w-8 text-ink" />}
             title="No groups yet"
-            description="Create a new circle or join an existing group with an invite code to start splitting expenses transparently on Stellar."
+            description="You haven't joined any groups yet. Create a new group to get started!"
             action={
               <div className="flex flex-wrap items-center justify-center gap-2">
                 <Button onClick={() => setCreateOpen(true)}>
@@ -63,7 +70,12 @@ export default function GroupsPage() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {groups.map((group) => (
-              <Link key={group.id} href={`/groups/${group.id}`}>
+              <Link
+                key={group.id}
+                href={`/groups/${group.id}`}
+                data-testid="group-card"
+                data-group-id={group.id}
+              >
                 <Card className="h-full transition-all hover:-translate-y-1 hover:shadow-brutal-lg">
                   <CardContent className="p-5 flex flex-col justify-between h-full">
                     <div>
@@ -75,9 +87,16 @@ export default function GroupsPage() {
                           {group.memberCount} member{group.memberCount === 1 ? "" : "s"}
                         </span>
                       </div>
-                      <h2 className="font-display text-lg uppercase tracking-tight truncate">
-                        {group.name}
-                      </h2>
+                      <div className="flex items-center gap-2">
+                        <h2 className="min-w-0 flex-1 font-display text-lg uppercase tracking-tight truncate">
+                          {group.name}
+                        </h2>
+                        {group.id === activeGroupId && (
+                          <span className="shrink-0 rounded-full border-2 border-ink bg-lime px-2 py-0.5 font-mono text-[10px] font-bold uppercase shadow-brutal-sm">
+                            Active
+                          </span>
+                        )}
+                      </div>
                       {group.description && (
                         <p className="mt-1 text-sm text-ink/70 line-clamp-2">
                           {group.description}
@@ -98,6 +117,6 @@ export default function GroupsPage() {
         <CreateGroupDialog open={createOpen} onClose={() => setCreateOpen(false)} />
         <JoinGroupDialog open={joinOpen} onClose={() => setJoinOpen(false)} />
       </div>
-    </ErrorBoundary>
+    </GroupErrorBoundary>
   );
 }

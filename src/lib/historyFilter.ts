@@ -7,6 +7,7 @@
  * fresh array.
  */
 import type { Expense, Settlement } from "./types";
+import { isExpenseSettled } from "./expenseFilters";
 
 /** A search/filter predicate applied to one history item. */
 export interface HistoryFilters {
@@ -14,6 +15,8 @@ export interface HistoryFilters {
   keyword?: string;
   /** Narrow to a single settlement asset code (e.g. "XLM", "USDC"). */
   assetCode?: string;
+  /** Filter by settlement or expense status (e.g. "pending", "settled", "failed"). */
+  status?: string;
   /** Only show records where this participant (name) took part. */
   participant?: string;
   /** Only show records on or after this date (ISO, inclusive). */
@@ -30,10 +33,13 @@ export interface HistoryRow {
   id: string;
   createdAt: string;
   assetCode: string;
+  status: string;
   /** Free-text haystack: title, memo and every participant's display name. */
   searchText: string;
   /** Every display name involved in the record (payer, payee, members). */
   participants: string[];
+  /** Every participant address (Stellar public key) involved in the record. */
+  addresses?: string[];
 }
 
 function normalize(s: string | null | undefined): string {
@@ -49,42 +55,59 @@ export function toHistoryRow(item: { type: "expense" | "settlement" } & (
   | Settlement
 )): HistoryRow {
   if (item.type === "expense") {
+    const expense = item as Expense;
     return {
       type: "expense",
-      id: (item as Expense).id,
-      createdAt: (item as Expense).createdAt,
-      assetCode: (item as Expense).assetCode ?? "",
+      id: expense.id,
+      createdAt: expense.createdAt,
+      assetCode: expense.assetCode ?? "",
+      status: isExpenseSettled(expense) ? "settled" : "pending",
       searchText: [
-        (item as Expense).title,
-        (item as Expense).description,
-        (item as Expense).memo,
-        (item as Expense).payer?.displayName,
-        ...((item as Expense).shares ?? []).map((s) => s.user?.displayName),
+        expense.title,
+        expense.description,
+        expense.memo,
+        expense.payer?.displayName,
+        expense.payer?.stellarPublicKey,
+        ...(expense.shares ?? []).flatMap((s) => [s.user?.displayName, s.user?.stellarPublicKey]),
       ]
         .filter(Boolean)
         .join(" "),
       participants: [
-        (item as Expense).payer?.displayName,
-        ...((item as Expense).shares ?? []).map((s) => s.user?.displayName),
+        expense.payer?.displayName,
+        ...(expense.shares ?? []).map((s) => s.user?.displayName),
+      ]
+        .filter((p): p is string => Boolean(p)),
+      addresses: [
+        expense.payer?.stellarPublicKey,
+        ...(expense.shares ?? []).map((s) => s.user?.stellarPublicKey),
       ]
         .filter((p): p is string => Boolean(p)),
     };
   }
+  const settlement = item as Settlement;
   return {
     type: "settlement",
-    id: (item as Settlement).id,
-    createdAt: (item as Settlement).createdAt,
-    assetCode: (item as Settlement).assetCode ?? "",
+    id: settlement.id,
+    createdAt: settlement.createdAt,
+    assetCode: settlement.assetCode ?? "",
+    status: settlement.status === "confirmed" ? "settled" : settlement.status ?? "pending",
     searchText: [
-      (item as Settlement).memo,
-      (item as Settlement).from?.displayName,
-      (item as Settlement).to?.displayName,
+      settlement.memo,
+      settlement.stellarTxHash,
+      settlement.from?.displayName,
+      settlement.from?.stellarPublicKey,
+      settlement.to?.displayName,
+      settlement.to?.stellarPublicKey,
     ]
       .filter(Boolean)
       .join(" "),
     participants: [
-      (item as Settlement).from?.displayName,
-      (item as Settlement).to?.displayName,
+      settlement.from?.displayName,
+      settlement.to?.displayName,
+    ].filter((p): p is string => Boolean(p)),
+    addresses: [
+      settlement.from?.stellarPublicKey,
+      settlement.to?.stellarPublicKey,
     ].filter((p): p is string => Boolean(p)),
   };
 }
@@ -101,17 +124,27 @@ export function matchesHistoryFilters(
       filters.kind === "expenses" ? "expense" : "settlement";
     if (kindType !== row.type) return false;
   }
-  if (filters.assetCode) {
+  if (filters.assetCode && filters.assetCode !== "all") {
     const code = normalize(filters.assetCode);
     if (code && normalize(row.assetCode) !== code) return false;
   }
+  if (filters.status && filters.status !== "all") {
+    const statusFilter = normalize(filters.status);
+    const rowStatus = normalize(row.status);
+    if (statusFilter === "pending") {
+      if (!["pending", "submitted", "settling"].includes(rowStatus)) return false;
+    } else if (statusFilter === "settled" || statusFilter === "confirmed") {
+      if (!["settled", "confirmed"].includes(rowStatus)) return false;
+    } else if (statusFilter) {
+      if (rowStatus !== statusFilter) return false;
+    }
+  }
   if (filters.participant) {
-    const name = normalize(filters.participant);
-    if (
-      name &&
-      !row.participants.some((p) => normalize(p).includes(name))
-    ) {
-      return false;
+    const target = normalize(filters.participant);
+    if (target) {
+      const matchesName = row.participants.some((p) => normalize(p).includes(target));
+      const matchesAddress = (row.addresses ?? []).some((a) => normalize(a).includes(target));
+      if (!matchesName && !matchesAddress) return false;
     }
   }
   if (filters.keyword) {
@@ -142,7 +175,8 @@ export function matchesHistoryFilters(
 export function hasActiveFilters(filters: HistoryFilters): boolean {
   return Boolean(
     filters.keyword ||
-      filters.assetCode ||
+      (filters.assetCode && filters.assetCode !== "all") ||
+      (filters.status && filters.status !== "all") ||
       filters.participant ||
       filters.fromDate ||
       filters.toDate ||
@@ -159,4 +193,36 @@ export function filterHistoryRows(
   filters: HistoryFilters
 ): HistoryRow[] {
   return rows.filter((row) => matchesHistoryFilters(row, filters));
+}
+
+/** Chronological ordering for history items (issue #314). */
+export type HistorySortOrder = "newest" | "oldest";
+
+/**
+ * Sortable history item shape. Accepts the history page's wrapper records
+ * (`date`) as well as raw Expense/Settlement records (`createdAt`); items
+ * with neither (or an unparseable date) sort as epoch (oldest).
+ */
+export interface HistorySortableItem {
+  date?: string;
+  createdAt?: string;
+}
+
+/**
+ * Sort history items by date. Pure: returns a fresh array and never mutates
+ * the caller's list. Ties keep their original input order (stable sort) in
+ * both directions, so repeated renders don't reshuffle equal timestamps.
+ */
+export function sortHistoryRows<T extends HistorySortableItem>(
+  items: T[],
+  order: HistorySortOrder = "newest"
+): T[] {
+  const toTime = (item: T): number => {
+    const t = new Date(item.date ?? item.createdAt ?? "").getTime();
+    return Number.isNaN(t) ? 0 : t;
+  };
+  const direction = order === "newest" ? -1 : 1;
+  return [...items].sort(
+    (a, b) => direction * (toTime(a) - toTime(b))
+  );
 }

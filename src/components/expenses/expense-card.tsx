@@ -19,6 +19,7 @@ import { useDeleteExpense } from "@/lib/queries";
 import { handleApiError } from "@/lib/errorHandler";
 import { Timestamp } from "@/components/timestamp";
 import { ExpenseReceiptModal } from "@/components/ExpenseReceiptModal";
+import { MemoBadge } from "@/components/stellar/MemoBadge";
 import type { Expense, GroupMember } from "@/lib/types";
 
 export function ExpenseCard({
@@ -77,7 +78,11 @@ export function ExpenseCard({
   }
 
   return (
-    <Card className={isPending ? "opacity-70 bg-cream/50" : undefined}>
+    <Card
+      className={isPending ? "opacity-70 bg-cream/50" : undefined}
+      data-testid="expense-card"
+      data-expense-id={expense.id}
+    >
       <div className="flex items-stretch">
         {selectable && (
           <button
@@ -134,7 +139,7 @@ export function ExpenseCard({
             </p>
           </div>
           <div className="text-right">
-            <Money value={expense.amount} assetCode={expense.assetCode} />
+            <Money value={expense.amount} assetCode={expense.assetCode} assetIssuer={expense.assetIssuer} />
             <div className="mt-1 flex items-center justify-end gap-1.5">
               <AssetBadge code={expense.assetCode} />
               <FiatEquivalent amount={expense.amount} assetCode={expense.assetCode} />
@@ -152,11 +157,7 @@ export function ExpenseCard({
             <span className="font-display text-[10px] uppercase tracking-widest text-ink/50">
               Shares · {settledCount}/{expense.shares.length} settled
             </span>
-            {expense.memo && (
-              <span className="font-mono text-[10px] text-ink/40">
-                memo: {expense.memo}
-              </span>
-            )}
+            {expense.memo && <MemoBadge memo={expense.memo} compact />}
           </div>
           <div className="space-y-1.5">
             {expense.shares.map((share) => {
@@ -164,6 +165,8 @@ export function ExpenseCard({
               return (
                 <div
                   key={share.id}
+                  data-testid="expense-share"
+                  data-user-id={share.userId}
                   className="flex items-center justify-between rounded-lg border-2 border-ink bg-white px-3 py-1.5"
                 >
                   <span className="flex items-center gap-2">
@@ -174,7 +177,7 @@ export function ExpenseCard({
                     </span>
                   </span>
                   <span className="flex items-center gap-2">
-                    <Money value={share.shareAmount} assetCode={expense.assetCode} />
+                    <Money value={share.shareAmount} assetCode={expense.assetCode} assetIssuer={expense.assetIssuer} />
                     <FiatInline amount={share.shareAmount} assetCode={expense.assetCode} />
                     <Badge tone={statusTone(share.status)}>{share.status}</Badge>
                   </span>

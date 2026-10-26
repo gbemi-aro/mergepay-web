@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   useInfiniteQuery,
   useMutation,
@@ -8,7 +8,8 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api, getInviteByCode } from "./api";
-import { handleApiError } from "./errorHandler";
+import { ApiRequestError, handleApiError } from "./errorHandler";
+import { toast } from "sonner";
 import { useAuth } from "./auth-store";
 import type {
   BalancesResponse,
@@ -19,6 +20,7 @@ import type {
   CreateSettlementRequest,
   EnableTreasuryRequest,
   GroupActivityResponse,
+  GroupDetail,
   InviteRequest,
   SettleExpenseRequest,
   TreasuryDepositRequest,
@@ -44,6 +46,12 @@ import {
   createOptimisticExpenseEvent,
   calculateOptimisticActivityList,
 } from "./activity";
+import {
+  applyOptimisticSettlement,
+  buildOptimisticExpense,
+  insertOptimisticExpense,
+  removeOptimisticExpense,
+} from "./optimistic";
 
 export const qk = {
   me: ["me"] as const,
@@ -57,11 +65,28 @@ export const qk = {
   treasury: (groupId: string) => ["groups", groupId, "treasury"] as const,
   treasuryHistory: (groupId: string) =>
     ["groups", groupId, "treasury", "history"] as const,
+  /**
+   * Prefix for the cross-group treasury aggregate. The live key appends the
+   * sorted group ids, so a treasury balance mutation invalidates this prefix
+   * and every id variant with it.
+   */
+  treasuryAggregate: ["treasury", "aggregate"] as const,
   anchors: ["anchors"] as const,
   anchorSessions: ["anchors", "sessions"] as const,
   history: ["history"] as const,
   invite: (code: string) => ["invites", code] as const,
 };
+
+/**
+ * Freshness window for data that only moves when *we* change it: the group
+ * list, a group's roster, and treasury balances. Every mutation that can alter
+ * one of them invalidates its key (see `expenseCacheKeys` / `groupCacheKeys`),
+ * so the cache can be served for a full minute without risking a stale render
+ * — and a burst of tab-focus or mount events stops turning into one HTTP call
+ * per open group. Data a counterparty can move underneath us (the "settle up"
+ * balances) deliberately stays at `staleTime: 0`.
+ */
+const MUTATION_DRIVEN_STALE_TIME_MS = 60_000;
 
 /** Polling parameters for settlement status while pending/submitted. */
 export const SETTLEMENT_POLL_INTERVAL_MS = 3_000;
@@ -73,15 +98,23 @@ export const SETTLEMENT_POLL_INTERVAL_MS = 3_000;
  * dead upstream endpoints.
  */
 export const SETTLEMENT_POLL_MAX_PERSISTENT_FAILURES = 3;
+/**
+ * Longest a settlement is polled while the API keeps answering that it is
+ * still pending. Stellar closes a ledger every few seconds, so a payment that
+ * is still unconfirmed after this long needs the user's attention rather than
+ * more silent polling (and a dialog that cannot be closed meanwhile).
+ */
+export const SETTLEMENT_POLL_MAX_DURATION_MS = 120_000;
 
 /**
  * Returns the next poll delay (in ms) for a settlement-status query, or
  * `false` to stop polling once the response reached a terminal state.
  * Exported separately so the stop behavior is unit-testable.
  *
- * The function short-circuits to `false` in three situations:
+ * The function short-circuits to `false` in these situations:
  *  - the latest response status is terminal (`confirmed` / `failed`),
- *  - no data has ever loaded and failures have piled up, or
+ *  - no data has ever loaded and failures have piled up,
+ *  - polling has run for {@link SETTLEMENT_POLL_MAX_DURATION_MS} (`timedOut`), or
  *  - the calling site passes nothing (defensive default).
  */
 export function settlementPollInterval(query: {
@@ -89,9 +122,11 @@ export function settlementPollInterval(query: {
     data?: { status?: string };
   };
   failureCount?: number;
+  timedOut?: boolean;
 }): number | false {
   const status = query.state.data?.status;
   if (status === "confirmed" || status === "failed") return false;
+  if (query.timedOut) return false;
 
   // Bound load on a broken upstream. With `retry: false`, each failed
   // refetch increments `failureCount` by 1; stopping after the cap keeps
@@ -138,6 +173,10 @@ export function useGroups() {
     queryKey: qk.groups,
     queryFn: api.listGroups,
     enabled: useSessionEnabled(),
+    // Rows carry `memberCount`, `yourNet` and *your* role; the create/join/
+    // leave/role mutations below all invalidate this key exactly, so reads can
+    // be served from cache for a minute.
+    staleTime: MUTATION_DRIVEN_STALE_TIME_MS,
   });
 }
 
@@ -146,13 +185,17 @@ export function useGroup(id: string) {
     queryKey: qk.group(id),
     queryFn: () => api.getGroup(id),
     enabled: useSessionEnabled() && Boolean(id),
+    // The roster only changes through this client's own member mutations,
+    // which invalidate the group prefix.
+    staleTime: MUTATION_DRIVEN_STALE_TIME_MS,
   });
 }
 
 export function useInviteByCode(code: string | null) {
+  const code_ = code ?? "";
   return useQuery({
-    queryKey: qk.invite(code ?? ""),
-    queryFn: () => getInviteByCode(code!),
+    queryKey: qk.invite(code_),
+    queryFn: () => getInviteByCode(code_),
     enabled: Boolean(code),
     retry: false,
     staleTime: 60_000,
@@ -278,6 +321,10 @@ export function useTreasuryInfo(groupId: string, enabled: boolean) {
     queryKey: qk.treasury(groupId),
     queryFn: () => api.treasuryInfo(groupId),
     enabled,
+    // Deposits and withdrawals invalidate this key (see `useTreasuryDeposit` /
+    // `useTreasuryWithdraw`), so the cached balance is never the one the user
+    // last acted on.
+    staleTime: MUTATION_DRIVEN_STALE_TIME_MS,
   });
 }
 
@@ -286,6 +333,7 @@ export function useTreasuryHistory(groupId: string, enabled: boolean) {
     queryKey: qk.treasuryHistory(groupId),
     queryFn: () => api.treasuryHistory(groupId),
     enabled,
+    staleTime: MUTATION_DRIVEN_STALE_TIME_MS,
   });
 }
 
@@ -311,7 +359,9 @@ export function useTreasuryAggregate(
   const ids = enabled.map((g) => g.id).sort();
 
   const query = useQuery({
-    queryKey: ["treasury", "aggregate", ids],
+    // Prefix lives in `qk` so treasury mutations can invalidate every cached
+    // id variant along with it.
+    queryKey: [...qk.treasuryAggregate, ids],
     queryFn: async (): Promise<TreasuryAggregate> => {
       const results = await Promise.allSettled(
         enabled.map((g) => api.treasuryInfo(g.id))
@@ -325,6 +375,10 @@ export function useTreasuryAggregate(
       return aggregateTreasury(sources);
     },
     enabled: sessionEnabled && enabled.length > 0,
+    // This queryFn is one HTTP call per treasury-enabled group, so letting it
+    // go stale on every mount/focus is the most expensive default in the app.
+    // Deposits and withdrawals invalidate the prefix instead.
+    staleTime: MUTATION_DRIVEN_STALE_TIME_MS,
   });
 
   return {
@@ -452,9 +506,19 @@ export function accumulateLedgerPages(
  * property, so we track consecutive poll failures locally in a ref and
  * pass the value into the (unit-testable) `settlementPollInterval` helper.
  */
-export function useSettlementStatus(settlementId: string | null, enabled = true) {
+export function useSettlementStatus(
+  settlementId: string | null,
+  enabled = true,
+  groupId?: string
+) {
   const failureCount = useRef(0);
+  const terminalSettlementId = useRef<string | null>(null);
   const [pollingStalled, setPollingStalled] = useState(false);
+  const [pollingTimedOut, setPollingTimedOut] = useState(false);
+  // Bumped by `restartPolling` so the deadline effect below starts a new window.
+  const [pollWindow, setPollWindow] = useState(0);
+  const timedOutRef = useRef(false);
+  const invalidate = useInvalidator();
 
   const query = useQuery({
     queryKey: settlementId ? qk.settlement(settlementId) : ["settlement", "_"],
@@ -465,6 +529,7 @@ export function useSettlementStatus(settlementId: string | null, enabled = true)
       settlementPollInterval({
         state: { data: q.state.data as { status?: string } | undefined },
         failureCount: failureCount.current,
+        timedOut: timedOutRef.current,
       }),
     refetchIntervalInBackground: false,
     // Cadence is handled by the polling interval — retrying on transient
@@ -475,6 +540,23 @@ export function useSettlementStatus(settlementId: string | null, enabled = true)
     retry: false,
     staleTime: 0,
   });
+
+  useEffect(() => {
+    if (
+      !groupId ||
+      !settlementId ||
+      (query.data?.status !== "confirmed" && query.data?.status !== "failed") ||
+      terminalSettlementId.current === settlementId
+    ) {
+      return;
+    }
+    terminalSettlementId.current = settlementId;
+    void invalidate([
+      ...expenseCacheKeys(groupId),
+      qk.activity(groupId),
+      qk.history,
+    ]);
+  }, [groupId, settlementId, query.data?.status, invalidate]);
 
   // Track consecutive failed poll cycles so the polling callback can
   // eventually return `false` once the cap is exceeded. `errorUpdatedAt`
@@ -497,7 +579,36 @@ export function useSettlementStatus(settlementId: string | null, enabled = true)
     }
   }, [query.isError, query.isSuccess, query.errorUpdatedAt, query.dataUpdatedAt]);
 
-  return { ...query, pollingStalled };
+  // Give up polling after SETTLEMENT_POLL_MAX_DURATION_MS even if every poll
+  // succeeds and the API keeps saying "pending". The window starts when polling
+  // is enabled for a settlement and is cleared when it ends (a terminal status
+  // flips `enabled` off) or the component unmounts.
+  useEffect(() => {
+    timedOutRef.current = false;
+    setPollingTimedOut(false);
+    if (!settlementId || !enabled) return;
+    const timer = setTimeout(() => {
+      timedOutRef.current = true;
+      setPollingTimedOut(true);
+    }, SETTLEMENT_POLL_MAX_DURATION_MS);
+    return () => clearTimeout(timer);
+  }, [settlementId, enabled, pollWindow]);
+
+  /**
+   * Start a fresh polling window after the user asked to check again. Pair it
+   * with `refetch()`: the refetch answers now, and polling resumes from there.
+   */
+  const restartPolling = useCallback(() => {
+    failureCount.current = 0;
+    // Cleared here as well as by the effect: a refetch that settles before React
+    // commits would otherwise re-read the interval while the old window still reads "over".
+    timedOutRef.current = false;
+    setPollingStalled(false);
+    setPollingTimedOut(false);
+    setPollWindow((n) => n + 1);
+  }, []);
+
+  return { ...query, pollingStalled, pollingTimedOut, restartPolling };
 }
 
 // ---------------------------------------------------------------------------
@@ -545,11 +656,36 @@ export function expenseCacheKeys(groupId: string): InvalidationTarget[] {
   ];
 }
 
+/**
+ * The queries a change to one group's own state can invalidate: that group's
+ * subtree plus the group list row.
+ *
+ * `qk.group(groupId)` is a prefix, so the single entry reaches the group's
+ * expenses, balances, ledger, activity and treasury caches — all of which
+ * render the roster, and a member leaving changes who appears in the
+ * simplified settlement suggestions. The list is matched exactly: its rows
+ * carry `memberCount`, `yourNet` and *your* role, and `["groups"]` is
+ * otherwise a prefix of every other group's cached data.
+ */
+export function groupCacheKeys(groupId: string): InvalidationTarget[] {
+  return [qk.group(groupId), { queryKey: qk.groups, exact: true }];
+}
+
+/**
+ * The caches holding treasury money: the group's own balance and history, plus
+ * the dashboard aggregate the same deposit moves.
+ */
+function treasuryCacheKeys(groupId: string): InvalidationTarget[] {
+  return [qk.treasury(groupId), qk.treasuryHistory(groupId), qk.treasuryAggregate];
+}
+
 export function useCreateGroup() {
   const invalidate = useInvalidator();
   return useMutation({
     mutationFn: (data: CreateGroupRequest) => api.createGroup(data),
-    onSuccess: () => invalidate([qk.groups]),
+    // Exact, everywhere the list is invalidated: `["groups"]` is a prefix of
+    // every per-group key, so a loose match refetches all a user's groups.
+    onSuccess: () => invalidate([{ queryKey: qk.groups, exact: true }]),
   });
 }
 
@@ -557,7 +693,7 @@ export function useJoinGroup() {
   const invalidate = useInvalidator();
   return useMutation({
     mutationFn: (code: string) => api.joinGroup(code),
-    onSuccess: () => invalidate([qk.groups]),
+    onSuccess: () => invalidate([{ queryKey: qk.groups, exact: true }]),
   });
 }
 
@@ -565,7 +701,7 @@ export function useLeaveGroup(groupId: string) {
   const invalidate = useInvalidator();
   return useMutation({
     mutationFn: () => api.leaveGroup(groupId),
-    onSuccess: () => invalidate([qk.groups]),
+    onSuccess: () => invalidate([{ queryKey: qk.groups, exact: true }]),
   });
 }
 
@@ -573,7 +709,7 @@ export function useArchiveGroup(groupId: string) {
   const invalidate = useInvalidator();
   return useMutation({
     mutationFn: () => api.archiveGroup(groupId),
-    onSuccess: () => invalidate([qk.groups, qk.group(groupId)]),
+    onSuccess: () => invalidate(groupCacheKeys(groupId)),
   });
 }
 
@@ -582,7 +718,7 @@ export function useUpdateMemberRole(groupId: string) {
   return useMutation({
     mutationFn: ({ memberId, role }: { memberId: string; role: Role }) =>
       api.updateMemberRole(groupId, memberId, role),
-    onSuccess: () => invalidate([qk.group(groupId)]),
+    onSuccess: () => invalidate(groupCacheKeys(groupId)),
   });
 }
 
@@ -590,7 +726,7 @@ export function useRemoveMember(groupId: string) {
   const invalidate = useInvalidator();
   return useMutation({
     mutationFn: (memberId: string) => api.removeMember(groupId, memberId),
-    onSuccess: () => invalidate([qk.group(groupId), qk.groups]),
+    onSuccess: () => invalidate(groupCacheKeys(groupId)),
   });
 }
 
@@ -647,6 +783,38 @@ export function calculateOptimisticBalances(
   };
 }
 
+/**
+ * Automatic retries for a failed expense creation, on top of the query
+ * client's defaults. A flaky mobile connection is transient by nature and
+ * the request carries an `Idempotency-Key` (see the expense form), so a
+ * retry cannot create the expense twice.
+ */
+export const EXPENSE_CREATE_MAX_RETRIES = 2;
+
+/** Exponential backoff (ms) between expense-creation retries, capped. */
+export function expenseCreateRetryDelay(attempt: number): number {
+  return Math.min(1000 * 2 ** attempt, 8_000);
+}
+
+/**
+ * Retry policy for expense creation: retry transient failures (network drops,
+ * 5xx) up to the cap, but never a deterministic 4xx response. Retries are
+ * only safe because the request carries an idempotency key.
+ */
+export function shouldRetryExpenseCreate(
+  failureCount: number,
+  error: unknown
+): boolean {
+  // Only a *classified* HTTP outcome is worth a second attempt: a dropped
+  // connection (status 0) or a transient server-side failure (5xx). A 4xx is
+  // deterministic, and an unclassified error is not something a retry can
+  // plausibly fix — surface both immediately so the form stays responsive.
+  if (!(error instanceof ApiRequestError)) return false;
+  const transient = error.status === 0 || error.status >= 500;
+  if (!transient) return false;
+  return failureCount < EXPENSE_CREATE_MAX_RETRIES;
+}
+
 export function useCreateExpense(groupId: string) {
   const invalidate = useInvalidator();
   const qc = useQueryClient();
@@ -654,20 +822,52 @@ export function useCreateExpense(groupId: string) {
 
   return useMutation({
     mutationFn: (data: CreateExpenseRequest) => api.createExpense(groupId, data),
+    // Retry only what can succeed on a second attempt. 4xx responses are
+    // deterministic (validation, auth), so surface them immediately; network
+    // drops and 5xx are worth a bounded retry.
+    retry: shouldRetryExpenseCreate,
+    retryDelay: expenseCreateRetryDelay,
     // Optimistically update group member balances and activity feed before the API responds
     onMutate: async (data: CreateExpenseRequest) => {
+      const expensesKey = qk.expenses(groupId);
       const balanceKey = qk.balances(groupId);
       const activityKey = qk.activity(groupId);
 
       // Cancel any outgoing refetches so they don't overwrite our optimistic update
       await Promise.all([
+        qc.cancelQueries({ queryKey: expensesKey }),
         qc.cancelQueries({ queryKey: balanceKey }),
         qc.cancelQueries({ queryKey: activityKey }),
       ]);
 
       // Save a snapshot of current query data for rollback on error
+      const previousExpenses = qc.getQueriesData({ queryKey: expensesKey });
       const previousBalances = qc.getQueryData<BalancesResponse>(balanceKey);
       const previousActivity = qc.getQueryData<GroupActivityResponse>(activityKey);
+
+      const payer = me.data?.user ?? useAuth.getState().user;
+
+      // Insert the new expense at the top of the list straight away (#375).
+      // It carries `isOptimistic`, which the expense card renders dimmed with
+      // a "Saving…" badge until the invalidation refetch replaces it with the
+      // server's copy (or the rollback below removes it).
+      if (payer) {
+        const detail = qc.getQueryData<GroupDetail>(qk.group(groupId));
+        const memberById = new Map(
+          (detail?.members ?? []).map((m) => [m.userId, m.user])
+        );
+        const optimisticExpense = buildOptimisticExpense({
+          groupId,
+          request: data,
+          payer,
+          resolveUser: (userId) =>
+            memberById.get(userId) ??
+            (payer.id === userId ? payer : undefined),
+        });
+        qc.setQueriesData({ queryKey: expensesKey }, (old: unknown) =>
+          insertOptimisticExpense(old, optimisticExpense)
+        );
+      }
 
       // Apply optimistic update only if previous balance cache exists
       if (previousBalances) {
@@ -695,10 +895,15 @@ export function useCreateExpense(groupId: string) {
         return calculateOptimisticActivityList(old, optEvent);
       });
 
-      return { previousBalances, previousActivity };
+      return { previousExpenses, previousBalances, previousActivity };
     },
     // On failure, revert back to saved snapshot and display error toast
     onError: (err, _variables, context) => {
+      if (context?.previousExpenses) {
+        for (const [queryKey, queryData] of context.previousExpenses) {
+          qc.setQueryData(queryKey, queryData);
+        }
+      }
       if (context?.previousBalances) {
         qc.setQueryData(qk.balances(groupId), context.previousBalances);
       }
@@ -706,6 +911,13 @@ export function useCreateExpense(groupId: string) {
         qc.setQueryData(qk.activity(groupId), context.previousActivity);
       }
       handleApiError(err, "Failed to create expense. Balances and activity reverted.");
+    },
+    // Confirm the expense landed on the server and notify the user.
+    onSuccess: () => {
+      toast.success("Expense added successfully");
+      // Keep the transaction history in sync alongside the group list so
+      // the history page reflects the new expense without a manual refresh.
+      qc.invalidateQueries({ queryKey: qk.history });
     },
     // Refetch canonical data on settlement (success or error) so the list,
     // balances, ledger, and activity feed reflect the server's view.
@@ -725,10 +937,52 @@ export function useGroupActivity(groupId: string) {
 }
 
 export function useDeleteExpense(groupId: string) {
+  const qc = useQueryClient();
   const invalidate = useInvalidator();
+
   return useMutation({
     mutationFn: (expenseId: string) => api.deleteExpense(expenseId),
-    onSuccess: () => invalidate(expenseCacheKeys(groupId)),
+
+    onMutate: async (expenseId: string) => {
+      const expensesKey = qk.expenses(groupId);
+      const activityKey = qk.activity(groupId);
+
+      // Cancel in-flight refetches so they don't overwrite the removal.
+      await Promise.all([
+        qc.cancelQueries({ queryKey: expensesKey }),
+        qc.cancelQueries({ queryKey: activityKey }),
+      ]);
+
+      // Snapshot everything we touch so onError can roll back cleanly.
+      const previousExpenses = qc.getQueriesData({ queryKey: expensesKey });
+      const previousActivity = qc.getQueryData<GroupActivityResponse>(activityKey);
+
+      // Remove the expense from every cache entry that holds it (flat +
+      // infinite variants handled by removeOptimisticExpense).
+      qc.setQueriesData({ queryKey: expensesKey }, (old: unknown) =>
+        removeOptimisticExpense(old, expenseId)
+      );
+
+      return { previousExpenses, previousActivity };
+    },
+
+    onError: (_err, _expenseId, context) => {
+      // Put every cache entry back the way it was.
+      if (context?.previousExpenses) {
+        for (const [queryKey, queryData] of context.previousExpenses) {
+          qc.setQueryData(queryKey, queryData);
+        }
+      }
+      if (context?.previousActivity) {
+        qc.setQueryData(qk.activity(groupId), context.previousActivity);
+      }
+    },
+
+    onSettled: () => {
+      // Whether it succeeded or failed, let the server's view win.
+      invalidate(expenseCacheKeys(groupId));
+      qc.invalidateQueries({ queryKey: qk.activity(groupId) });
+    },
   });
 }
 
@@ -762,7 +1016,6 @@ export function useCreateSettlement(groupId: string) {
 }
 
 export function useConfirmSettlement(groupId: string) {
-  const invalidate = useInvalidator();
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({
@@ -771,18 +1024,40 @@ export function useConfirmSettlement(groupId: string) {
     }: {
       settlementId: string;
       data: ConfirmSettlementRequest;
+      optimisticTransfer?: {
+        fromUserId: string;
+        toUserId: string;
+        amount: string;
+        assetCode: string;
+      };
     }) => api.confirmSettlement(settlementId, data),
+    onMutate: async ({ optimisticTransfer }) => {
+      const balancesKey = qk.balances(groupId);
+      await qc.cancelQueries({ queryKey: balancesKey });
+      const previousBalances = qc.getQueryData<BalancesResponse>(balancesKey);
+
+      if (previousBalances && optimisticTransfer) {
+        qc.setQueryData<BalancesResponse>(balancesKey, (old) =>
+          old ? applyOptimisticSettlement(old, optimisticTransfer) : old
+        );
+      }
+
+      return { previousBalances };
+    },
+    onError: (_error, _variables, context) => {
+      if (context?.previousBalances) {
+        qc.setQueryData(qk.balances(groupId), context.previousBalances);
+      }
+      toast.error("Settlement submission failed. Balances were restored.");
+    },
     onSuccess: (_data, vars) => {
       // Seed the polled cache so the dialog reflects "submitted" without
-      // forcing an immediate refetch before its first interval tick.
+      // forcing an immediate refetch before its first interval tick. Keep the
+      // optimistic balance until the status poll reaches a terminal state.
       qc.setQueryData(qk.settlement(vars.settlementId), _data.settlement);
-      invalidate([
-        qk.expenses(groupId),
-        qk.balances(groupId),
-        qk.ledger(groupId),
-        qk.groups,
-        qk.history,
-      ]);
+      if (_data.settlement.status !== "confirmed" && _data.settlement.status !== "failed") {
+        toast.info("Settlement submitted; waiting for Stellar confirmation");
+      }
     },
   });
 }
@@ -792,14 +1067,18 @@ export function useEnableTreasury(groupId: string) {
   return useMutation({
     mutationFn: (data: EnableTreasuryRequest) =>
       api.enableTreasury(groupId, data),
-    onSuccess: () => invalidate([qk.group(groupId), qk.groups]),
+    onSuccess: () => invalidate(groupCacheKeys(groupId)),
   });
 }
 
 export function useTreasuryDeposit(groupId: string) {
+  const invalidate = useInvalidator();
   return useMutation({
     mutationFn: (data: TreasuryDepositRequest) =>
       api.treasuryDeposit(groupId, data),
+    // Mirrors withdrawal: without this the panel keeps showing the
+    // pre-deposit balance until the stale window happens to expire.
+    onSuccess: () => invalidate(treasuryCacheKeys(groupId)),
   });
 }
 
@@ -808,8 +1087,7 @@ export function useTreasuryWithdraw(groupId: string) {
   return useMutation({
     mutationFn: (data: TreasuryWithdrawRequest) =>
       api.treasuryWithdraw(groupId, data),
-    onSuccess: () =>
-      invalidate([qk.treasury(groupId), qk.treasuryHistory(groupId)]),
+    onSuccess: () => invalidate(treasuryCacheKeys(groupId)),
   });
 }
 

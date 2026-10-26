@@ -2,27 +2,39 @@
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { AlertTriangle, CheckCircle2, Loader2, Lock, PenLine, Plug, RefreshCcw, Send, ShieldX, Wallet } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, Loader2, Lock, PenLine, Plug, QrCode, RefreshCcw, Send, ShieldX, Wallet } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
+import { TxProgress, TxStatusPanel } from "@/components/ui/tx-progress";
 import { Button } from "@/components/ui/button";
 import { Avatar } from "@/components/ui/avatar";
 import { Money } from "@/components/amount";
 import { AssetBadge } from "@/components/asset-badge";
 import { TxLink } from "@/components/tx-link";
 import { SettlementConfirmation } from "@/components/settle/settlement-confirmation";
+import { MemoBadge } from "@/components/stellar/MemoBadge";
+import { PaymentQRCode } from "@/components/ui/PaymentQRCode";
+import { cn } from "@/lib/utils";
 import { api, ApiRequestError } from "@/lib/api";
 import { formatMoney } from "@/lib/format";
 import { connectWallet, signXdr, WalletError, WalletErrorCode, NotInstalledMessage } from "@/lib/stellar";
 import { useWalletStatus } from "@/hooks/useWalletStatus";
 import { WalletPrerequisiteNotice } from "@/components/wallet/wallet-status";
 import { useConfirmSettlement, useSettlementStatus } from "@/lib/queries";
+import { classifySettlementError } from "@/lib/stellar/transactions";
+import { notifySettlementFailure, notifySettlementStatusUnknown } from "@/lib/settlementToasts";
 import { validateSettlementInput } from "@/lib/paymentValidation";
+import {
+  createSettlementFormSchema,
+  fieldErrorsFrom,
+} from "@/lib/validators";
 import { recoveryActionFor, retryLabelFor } from "@/lib/settlementRetry";
 import { useWalletDisconnected } from "@/lib/wallet-store";
 import type { SettlementStep, SettleTarget } from "@/lib/useSettlementFlow";
 import type { SettlementSuggestion, User } from "@/lib/types";
 import { FeeEstimatorWidget } from "@/components/FeeEstimatorWidget";
 import { MemoPreview } from "@/components/settle/MemoPreview";
+import { MemoWarningBanner } from "@/components/MemoWarningBanner";
+import { verifyTransactionMemo } from "@/lib/memo";
 import { generateShortCode, buildSettlementMemo } from "@/lib/memoValidation";
 import { TrustlineDetectionBanner } from "@/components/settle/TrustlineDetectionBanner";
 import { TrustlinePromptModal, type TrustlineAssetInfo } from "@/components/settle/TrustlinePromptModal";
@@ -39,6 +51,28 @@ type Step =
   | "submitted"
   | "confirmed"
   | "failed";
+
+/** The legs the progress bar shows. Same shape as the settlement modal's. */
+const PROGRESS = [
+  { id: "review", label: "Review" },
+  { id: "sign", label: "Sign" },
+  { id: "submit", label: "Submit" },
+  { id: "done", label: "Done" },
+] as const;
+
+/** Index into {@link PROGRESS} of the leg a failure happened in. */
+const FAILED_AT_REVIEW = 0;
+const FAILED_AT_SIGNING = 1;
+const FAILED_AT_NETWORK = 2;
+
+const STELLAR_REJECTED_MESSAGE = "Stellar rejected this transaction. Please try again.";
+
+/** Classified form of "Stellar accepted the request but refused the payment". */
+function stellarRejection() {
+  return classifySettlementError(
+    Object.assign(new Error("Stellar rejected this payment. No funds moved."), { code: "tx_failed" })
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Step metadata for status cards
@@ -177,12 +211,20 @@ export function SettleDialog({
   const [settlementId, setSettlementId] = useState<string | null>(null);
   const [step, setStep] = useState<Step>("review");
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [memo, setMemo] = useState<string | null>(null);
   const [error, setError] = useState<ReactNode>("");
   const [errorCode, setErrorCode] = useState<WalletErrorCode | null>(null);
   const [attempts, setAttempts] = useState(0);
   const [reconnecting, setReconnecting] = useState(false);
-  const statusQuery = useSettlementStatus(settlementId, step === "submitted");
-  const transactionInFlight = step === "submitting" || step === "submitted";
+  const [failedAt, setFailedAt] = useState(FAILED_AT_SIGNING);
+  const statusQuery = useSettlementStatus(settlementId, step === "submitted", groupId);
+  // Once status checks have stalled or run out of time the dialog is waiting on
+  // nothing it can observe, so the user must be free to leave instead of being
+  // held here until a reload. The payment may still confirm; the ledger and
+  // history pick it up when it does.
+  const statusUnknown =
+    step === "submitted" && Boolean(statusQuery.pollingStalled || statusQuery.pollingTimedOut);
+  const transactionInFlight = step === "submitting" || (step === "submitted" && !statusUnknown);
   // The settle target lives in props and is never mutated here, so a failed
   // attempt leaves the amount, asset, and recipient intact for the retry.
   const recovery = recoveryActionFor(errorCode);
@@ -194,6 +236,7 @@ export function SettleDialog({
 
   const isBulk = !!bulkTarget;
   const active = isBulk ? bulkTarget : target;
+  const [settleMethod, setSettleMethod] = useState<"wallet" | "qr">("wallet");
   const [editedMemo, setEditedMemo] = useState<string | null>(null);
   const [trustlineModalOpen, setTrustlineModalOpen] = useState(false);
   const [trustlinesReady, setTrustlinesReady] = useState(false);
@@ -224,14 +267,14 @@ export function SettleDialog({
   }, [active, isBulk, target, bulkTarget]);
 
   /** Prevent accidental dismissal while a transaction is in-flight. */
-  const dismissible = step !== "submitting" && step !== "submitted";
+  const dismissible = !transactionInFlight;
 
   function close() {
     if (transactionInFlight) return;
     onClose();
     // reset after the close animation
     setTimeout(() => {
-      setStep("review"); setTxHash(null); setError(""); setErrorCode(null); setSettlementId(null); setAttempts(0); setReconnecting(false);
+      setStep("review"); setTxHash(null); setMemo(null); setError(""); setErrorCode(null); setSettlementId(null); setAttempts(0); setReconnecting(false); setFailedAt(FAILED_AT_SIGNING); setSettleMethod("wallet");
     }, 200);
   }
 
@@ -243,11 +286,38 @@ export function SettleDialog({
     // established the connection themselves — the polled status is still a
     // tick behind at that point and would block a valid attempt.
     if (!options?.skipWalletGate && !wallet.canSign) return;
+    const activeMemo = editedMemo ?? previewMemo;
+    const memoCheck = verifyTransactionMemo(activeMemo, originalShortCode ?? undefined);
+    if (!memoCheck.isValid) {
+      setError(memoCheck.message);
+      setErrorCode(null);
+      setFailedAt(FAILED_AT_REVIEW);
+      setStep("failed");
+      return;
+    }
+    // Runtime gate (#339): the settlement input must satisfy the shared Zod
+    // schema before the hand-rolled validator — same rules, one source.
+    const schemaCheck = createSettlementFormSchema.safeParse({
+      toUserId: target.to.id,
+      amount: target.amount,
+      assetCode: target.assetCode,
+      assetIssuer: target.assetIssuer,
+    });
+    if (!schemaCheck.success) {
+      setError(Object.values(fieldErrorsFrom(schemaCheck))[0] ?? "Invalid payment input");
+      setErrorCode(null);
+      setFailedAt(FAILED_AT_REVIEW);
+      setStep("failed");
+      return;
+    }
     const validation = validateSettlementInput({ amount: target.amount, assetCode: target.assetCode, assetIssuer: target.assetIssuer });
-    if (!validation.valid) { setError(validation.error ?? "Invalid payment input"); setErrorCode(null); setStep("failed"); return; }
+    if (!validation.valid) { setError(validation.error ?? "Invalid payment input"); setErrorCode(null); setFailedAt(FAILED_AT_REVIEW); setStep("failed"); return; }
     // Clear the previous attempt's residue so a retry never shows a stale tx
     // hash or keeps polling the settlement that already failed.
-    setError(""); setErrorCode(null); setTxHash(null); setSettlementId(null); setAttempts((n) => n + 1);
+    setError(""); setErrorCode(null); setTxHash(null); setMemo(null); setSettlementId(null); setAttempts((n) => n + 1);
+    // Set once the wallet has signed: from then on a failure may still be a
+    // payment that reached the network, which the failure toast has to say.
+    let signed = false;
     try {
       const intent = target.expenseId
         ? await api.settleExpense(target.expenseId, {
@@ -259,22 +329,29 @@ export function SettleDialog({
             amount: target.amount,
             assetCode: target.assetCode,
             assetIssuer: target.assetIssuer,
-          });
-      setStep("submitting");
+          });          setStep("submitting");
+      // Surface the MP: memo shown by the API on the intent, falling back to
+      // the confirmed record — it is what ties this payment to its expense.
+      setMemo(intent.settlement.memo ?? null);
       const signedXdr = await signXdr(intent.xdr, intent.networkPassphrase);
+      signed = true;
       const { settlement } = await confirm.mutateAsync({
         settlementId: intent.settlement.id,
         data: { signedXdr },
+        optimisticTransfer: intent.settlement,
       });
       setSettlementId(intent.settlement.id);
       setTxHash(settlement.stellarTxHash ?? null);
+      setMemo(settlement.memo ?? intent.settlement.memo ?? null);
       setStep("submitted");
       if (settlement.status === "confirmed") {
         setStep("confirmed");
         toast.success("Settled on Stellar");
       } else if (settlement.status === "failed") {
+        setFailedAt(FAILED_AT_NETWORK);
         setStep("failed");
-        setError("Stellar rejected this transaction. Please try again.");
+        setError(STELLAR_REJECTED_MESSAGE);
+        notifySettlementFailure(stellarRejection());
       }
     } catch (e) {
       // Every failure lands in "failed" with the reason on screen and the
@@ -282,7 +359,15 @@ export function SettleDialog({
       if (e instanceof WalletError) { setErrorCode(e.code); setError(e.code === "not_installed" ? <NotInstalledMessage /> : e.message); }
       else if (e instanceof ApiRequestError) { setErrorCode(null); setError(e.message); }
       else { setErrorCode(null); setError("Settlement failed. Please try again."); }
+      setFailedAt(FAILED_AT_SIGNING);
       setStep("failed");
+      // The same outcome as a toast, for a user who has looked away. A decline
+      // in Freighter reads as a warning (nothing was sent), the rest as errors;
+      // a failure after the wallet signed says the payment might still go through.
+      const reason = e instanceof WalletError || e instanceof ApiRequestError
+        ? classifySettlementError(e)
+        : { kind: "unknown" as const, title: "Settlement failed", message: "Settlement failed. Please try again." };
+      notifySettlementFailure(reason, { submitted: signed });
     }
   }
 
@@ -307,8 +392,21 @@ export function SettleDialog({
     if (step !== "submitted" || !statusQuery.data) return;
     const live = statusQuery.data.stellarTxHash ?? null;
     if (statusQuery.data.status === "confirmed") { setTxHash(live); setStep("confirmed"); toast.success("Settled on Stellar"); }
-    else if (statusQuery.data.status === "failed") { setStep("failed"); setError("Stellar rejected this transaction. Please try again."); }
+    else if (statusQuery.data.status === "failed") {
+      setFailedAt(FAILED_AT_NETWORK);
+      setStep("failed");
+      setError(STELLAR_REJECTED_MESSAGE);
+      notifySettlementFailure(stellarRejection());
+    }
   }, [step, statusQuery.data]);
+
+  // Say so once when status checks give up (lost connection, or still pending
+  // after the polling window), so the dialog never looks like it is still working.
+  const statusUnknownReason = statusQuery.pollingTimedOut ? "timed_out" : statusQuery.pollingStalled ? "stalled" : null;
+  useEffect(() => {
+    if (step !== "submitted" || !statusUnknownReason) return;
+    notifySettlementStatusUnknown(statusUnknownReason);
+  }, [step, statusUnknownReason]);
 
   // `active` resolves to bulkTarget in bulk mode and target in single mode;
   // both share the {to, amount, assetCode, label} shape we render here.
@@ -323,12 +421,114 @@ export function SettleDialog({
   >
     <div className="space-y-5">
       <div className="rounded-2xl border-3 border-ink bg-paper p-5"><div className="flex items-center justify-between"><span className="font-display text-xs uppercase tracking-widest text-ink/50">Paying</span><AssetBadge code={active.assetCode} /></div><div className="mt-3 flex items-center gap-3"><Avatar user={active.to} size="lg" /><div><p className="font-display text-lg uppercase tracking-tight">{active.to.displayName}</p><Money value={active.amount} assetCode={active.assetCode} className="text-2xl" /></div></div></div>
-      {step === "review" && <><MemoPreview memo={previewMemo} expectedCode={originalShortCode} editable editedMemo={editedMemo ?? previewMemo ?? ""} onEdit={(v) => setEditedMemo(v)} />{trustlineAsset && wallet.address && (<TrustlineDetectionBanner publicKey={wallet.address} assetCode={trustlineAsset.code} assetIssuer={trustlineAsset.issuer} onSetupTrustline={() => setTrustlineModalOpen(true)} />)}<ol className="space-y-2 text-sm text-ink/70"><StepLine icon={<Wallet className="h-4 w-4" />}>Mergepay builds the payment — your keys never leave your wallet.</StepLine><StepLine icon={<PenLine className="h-4 w-4" />}>You sign it in Freighter.</StepLine><StepLine icon={<Send className="h-4 w-4" />}>It settles on Stellar and the ledger updates with the tx hash.</StepLine></ol><FeeEstimatorWidget operationCount={isBulk && bulkTarget ? bulkTarget.expenseIds.length + 1 : 1} amount={active.amount} assetCode={active.assetCode} /><WalletPrerequisiteNotice status={wallet} onRefresh={refreshWallet} /><div className="flex justify-end gap-2"><Button variant="ghost" onClick={close}>Cancel</Button><Button onClick={() => run()} disabled={!wallet.canSign || walletDisconnected} title={walletDisconnected ? "Reconnect your wallet to settle" : wallet.canSign ? undefined : wallet.message}><Wallet className="h-4 w-4" /> Settle now</Button></div></>}
+      {step !== "review" && (
+        <TxProgress
+          steps={PROGRESS}
+          completed={step === "submitting" ? 1 : step === "submitted" ? 2 : step === "confirmed" ? 3 : failedAt}
+          errored={step === "failed"}
+          label="Settlement progress"
+        />
+      )}
+      {step === "review" && (
+        <div className="flex rounded-xl border-2 border-ink bg-paper p-1">
+          <button
+            type="button"
+            onClick={() => setSettleMethod("wallet")}
+            className={cn(
+              "flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 font-display text-xs uppercase tracking-wider transition-all",
+              settleMethod === "wallet"
+                ? "border-2 border-ink bg-grape font-bold text-white shadow-brutal-sm"
+                : "text-ink/70 hover:text-ink"
+            )}
+          >
+            <Wallet className="h-4 w-4" /> Browser Wallet
+          </button>
+          <button
+            type="button"
+            onClick={() => setSettleMethod("qr")}
+            className={cn(
+              "flex flex-1 items-center justify-center gap-1.5 rounded-lg py-1.5 font-display text-xs uppercase tracking-wider transition-all",
+              settleMethod === "qr"
+                ? "border-2 border-ink bg-grape font-bold text-white shadow-brutal-sm"
+                : "text-ink/70 hover:text-ink"
+            )}
+          >
+            <QrCode className="h-4 w-4" /> Scan QR
+          </button>
+        </div>
+      )}
+      {step === "review" && settleMethod === "wallet" && (
+        <>
+          <MemoPreview
+            memo={previewMemo}
+            expectedCode={originalShortCode}
+            editable
+            editedMemo={editedMemo ?? previewMemo ?? ""}
+            onEdit={(v) => setEditedMemo(v)}
+          />
+          <MemoWarningBanner
+            memo={editedMemo ?? previewMemo}
+            expectedShortCode={originalShortCode}
+            onFixMemo={(v) => setEditedMemo(v)}
+          />
+          {trustlineAsset && wallet.address && (
+            <TrustlineDetectionBanner
+              publicKey={wallet.address}
+              assetCode={trustlineAsset.code}
+              assetIssuer={trustlineAsset.issuer}
+              onSetupTrustline={() => setTrustlineModalOpen(true)}
+            />
+          )}<ol className="space-y-2 text-sm text-ink/70"><StepLine icon={<Wallet className="h-4 w-4" />}>Mergepay builds the payment — your keys never leave your wallet.</StepLine><StepLine icon={<PenLine className="h-4 w-4" />}>You sign it in Freighter.</StepLine><StepLine icon={<Send className="h-4 w-4" />}>It settles on Stellar and the ledger updates with the tx hash.</StepLine></ol><FeeEstimatorWidget operationCount={isBulk && bulkTarget ? bulkTarget.expenseIds.length + 1 : 1} amount={active.amount} assetCode={active.assetCode} /><WalletPrerequisiteNotice status={wallet} onRefresh={refreshWallet} /><div className="flex justify-end gap-2"><Button variant="ghost" onClick={close}>Cancel</Button><Button onClick={() => run()} disabled={!wallet.canSign || walletDisconnected} title={walletDisconnected ? "Reconnect your wallet to settle" : wallet.canSign ? undefined : wallet.message}><Wallet className="h-4 w-4" /> Settle now</Button></div></>
+      )}
+      {step === "review" && settleMethod === "qr" && (
+        <div className="space-y-4">
+          <PaymentQRCode
+            address={active.to.stellarPublicKey}
+            amount={active.amount}
+            memo={editedMemo ?? previewMemo}
+            assetCode={active.assetCode}
+            assetIssuer={active.assetIssuer}
+          />
+          <div className="flex justify-end">
+            <Button variant="ghost" onClick={close}>Close</Button>
+          </div>
+        </div>
+      )}
 
-      {step === "submitting" && <div className="flex flex-col items-center gap-3 py-4" aria-busy aria-live="polite"><Button loading variant="outline" className="pointer-events-none">Submitting to Stellar…</Button><p className="text-center text-sm text-ink/60">Approve the transaction in your Freighter wallet, and we'll record it on the ledger.</p></div>}
-      {step === "submitted" && !statusQuery.pollingStalled && <div className="flex flex-col items-center gap-3 rounded-2xl border-3 border-ink bg-butter-pale px-4 py-5" role="status" aria-live="polite"><Loader2 className="h-7 w-7 animate-spin text-grape" /><p className="font-display text-sm uppercase tracking-tight">Waiting for confirmation</p><p className="text-center text-xs text-ink/60">Polling the network for the terminal transaction state. Keep this dialog open until the result is known.</p></div>}
-      {step === "submitted" && statusQuery.pollingStalled && <div className="flex flex-col items-center gap-3 rounded-2xl border-3 border-ink bg-flamingo-pale px-4 py-5" role="alert" aria-live="polite"><AlertTriangle className="h-7 w-7" /><p className="font-display text-sm uppercase tracking-tight">Couldn't check status</p><p className="text-center text-xs text-ink/60">We lost the connection while waiting for confirmation. Your transaction may still be processing — this hasn't submitted anything new.</p><Button variant="outline" onClick={() => statusQuery.refetch()}><RefreshCcw className="h-4 w-4" /> Check status</Button></div>}
-      {step === "confirmed" && <div className="space-y-4 text-center"><div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border-3 border-ink bg-lime shadow-brutal"><CheckCircle2 className="h-8 w-8" /></div><div><p className="font-display text-lg uppercase tracking-tight">Settled!</p><p className="text-sm text-ink/60">Recorded on the Stellar ledger.</p></div>{txHash && <div className="flex flex-col items-center gap-1"><span className="font-display text-[10px] uppercase tracking-widest text-ink/50">Transaction</span><TxLink hash={txHash} /></div>}<Button className="w-full" onClick={close}>Done</Button></div>}
+      {step === "submitting" && (
+        <TxStatusPanel
+          tone="grape"
+          icon={<Wallet className="h-7 w-7" />}
+          title="Submitting to Stellar"
+          body="Approve the transaction in your Freighter wallet, and we'll record it on the ledger."
+          live
+        />
+      )}
+      {step === "submitted" && !statusUnknown && (
+        <TxStatusPanel
+          tone="butter"
+          icon={<Loader2 className="h-7 w-7 animate-spin" />}
+          title="Waiting for confirmation"
+          body="Polling the network for the terminal transaction state. Keep this dialog open until the result is known."
+          live
+        />
+      )}
+      {statusUnknown && (
+        <div className="flex flex-col items-center gap-3 rounded-2xl border-3 border-ink bg-flamingo-pale px-4 py-5" role="alert" aria-live="polite">
+          {statusQuery.pollingTimedOut ? <Clock className="h-7 w-7" aria-hidden="true" /> : <AlertTriangle className="h-7 w-7" aria-hidden="true" />}
+          <p className="font-display text-sm uppercase tracking-tight">{statusQuery.pollingTimedOut ? "Still waiting for confirmation" : "Couldn't check status"}</p>
+          <p className="text-center text-xs text-ink/60">
+            {statusQuery.pollingTimedOut
+              ? "Stellar is taking longer than usual. Your payment may still confirm; checking again doesn't submit anything new, and you can close this and come back."
+              : "We lost the connection while waiting for confirmation. Your transaction may still be processing — this hasn't submitted anything new."}
+          </p>
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={close}>Close</Button>
+            <Button variant="outline" onClick={() => { statusQuery.restartPolling(); void statusQuery.refetch(); }}><RefreshCcw className="h-4 w-4" /> Check status</Button>
+          </div>
+        </div>
+      )}
+      {step === "confirmed" && <div className="space-y-4 text-center"><div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border-3 border-ink bg-lime shadow-brutal"><CheckCircle2 className="h-8 w-8" /></div><div><p className="font-display text-lg uppercase tracking-tight">Settled!</p><p className="text-sm text-ink/60">Recorded on the Stellar ledger.</p></div>{txHash && <div className="flex flex-col items-center gap-1"><span className="font-display text-[10px] uppercase tracking-widest text-ink/50">Transaction</span><TxLink hash={txHash} /></div>}{memo && <div className="flex flex-col items-center gap-1"><span className="font-display text-[10px] uppercase tracking-widest text-ink/50">Memo</span><MemoBadge memo={memo} /></div>}<Button className="w-full" onClick={close}>Done</Button></div>}
       {step === "failed" && <div className="space-y-4">
         <WalletErrorBanner code={errorCode} message={error} />
         <p className="text-xs text-ink/60">

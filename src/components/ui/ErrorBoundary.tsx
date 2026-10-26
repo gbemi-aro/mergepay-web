@@ -1,16 +1,21 @@
 "use client";
 
 import React, { Component, type ErrorInfo, type ReactNode } from "react";
-import { AlertTriangle, RefreshCw } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { AlertTriangle, LayoutDashboard, RefreshCw, RotateCcw } from "lucide-react";
+import { Button, buttonClassName } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { logRenderError } from "@/lib/errorHandler";
 
 interface Props {
   children: ReactNode;
   fallback?: ReactNode | ((error: Error, resetErrorBoundary: () => void) => ReactNode);
   onReset?: () => void;
   onError?: (error: Error, errorInfo: ErrorInfo) => void;
+  /** Destination of the "Return to Dashboard" escape hatch. */
+  dashboardHref?: string;
 }
+
+const DEFAULT_DASHBOARD_HREF = "/dashboard";
 
 interface State {
   hasError: boolean;
@@ -33,14 +38,26 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("[ErrorBoundary] caught an error:", error);
-    console.error("[ErrorBoundary] component stack:", errorInfo.componentStack);
+    // Structured and production-silent — the component stack of a crashed
+    // group view is full of account data that has no business in a browser
+    // console. Callers that need the raw error can subscribe via `onError`.
+    logRenderError(error, { componentStack: errorInfo.componentStack });
     this.props.onError?.(error, errorInfo);
   }
 
   private handleReset = () => {
     this.props.onReset?.();
     this.setState({ hasError: false, error: null });
+  };
+
+  /**
+   * Full document reload. `Try Again` re-renders the subtree, which is right
+   * when the failure was transient (a rejected wallet call, a bad response),
+   * but a crash caused by module or provider state survives that remount. The
+   * reload path guarantees the user is never stuck on the fallback.
+   */
+  private handleReload = () => {
+    window.location.reload();
   };
 
   public render() {
@@ -75,11 +92,28 @@ export class ErrorBoundary extends Component<Props, State> {
               </div>
             )}
 
-            <div className="flex justify-end gap-2 pt-2">
-              <Button onClick={this.handleReset} variant="primary">
-                <RefreshCw className="h-4 w-4 mr-1" />
-                Try Again
-              </Button>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+              {/* Full document navigation on purpose: a crashed subtree should
+                  come back through a clean reload rather than a soft client
+                  transition that could re-enter the same broken state. */}
+              <a
+                href={this.props.dashboardHref ?? DEFAULT_DASHBOARD_HREF}
+                className={buttonClassName("outline", "md")}
+                aria-label="Return to dashboard"
+              >
+                <LayoutDashboard className="h-4 w-4 mr-1" />
+                Return to Dashboard
+              </a>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={this.handleReload} variant="outline">
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                  Reload page
+                </Button>
+                <Button onClick={this.handleReset} variant="primary">
+                  <RotateCcw className="h-4 w-4 mr-1" />
+                  Try Again
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>

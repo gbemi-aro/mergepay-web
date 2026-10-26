@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { QRCodeCanvas } from "qrcode.react";
+import { QRCodeCanvas } from "@/components/ui/lazy-qr-code";
 import { Copy, Check, Share2 } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";

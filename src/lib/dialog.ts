@@ -77,6 +77,8 @@ export function shouldCloseOnEscape(args: {
 export interface FocusCandidate {
   /** Carries an explicit `data-autofocus` marker. */
   autofocus?: boolean;
+  /** Primary action within the dialog (e.g. submit button, primary CTA). */
+  primary?: boolean;
   /** Lives in the dialog body rather than the title bar. */
   inBody?: boolean;
 }
@@ -84,9 +86,9 @@ export interface FocusCandidate {
 /**
  * Index of the control that should receive focus when a dialog opens.
  *
- * Preference order: an explicitly marked control, then the first control in
- * the body (the first form field, rather than the close button), then anything
- * focusable at all. Returns -1 when the dialog has no focusable content, in
+ * Preference order: an explicitly marked control, then a primary action,
+ * then the first control in the body (the first form field, rather than the close button),
+ * then anything focusable at all. Returns -1 when the dialog has no focusable content, in
  * which case the caller focuses the panel itself so focus still enters the
  * dialog.
  */
@@ -96,10 +98,27 @@ export function pickInitialFocusIndex(candidates: FocusCandidate[]): number {
   const explicit = candidates.findIndex((c) => c.autofocus);
   if (explicit !== -1) return explicit;
 
+  const primary = candidates.findIndex((c) => c.primary);
+  if (primary !== -1) return primary;
+
   const firstInBody = candidates.findIndex((c) => c.inBody);
   if (firstInBody !== -1) return firstInBody;
 
   return 0;
+}
+
+/**
+ * Whether a control is the dialog's primary action, as the app marks them.
+ *
+ * `data-primary-action` and `data-primary` are explicit; a native submit
+ * button is the implicit case, since that is what Enter activates.
+ */
+export function isPrimaryAction(element: Element): boolean {
+  return (
+    element.hasAttribute("data-primary-action") ||
+    element.hasAttribute("data-primary") ||
+    element.getAttribute("type") === "submit"
+  );
 }
 
 /**
@@ -121,4 +140,45 @@ export function nextFocusIndex(
   if (currentIndex < 0) return shiftKey ? count - 1 : 0;
   if (shiftKey) return currentIndex === 0 ? count - 1 : null;
   return currentIndex === count - 1 ? 0 : null;
+}
+
+/**
+ * Builds the `focusin` listener that keeps keyboard focus inside an open
+ * dialog.
+ *
+ * Tab handling only constrains the next key press; focus can still leave the
+ * dialog through browser chrome, screen-reader shortcuts or programmatic
+ * `.focus()` calls, and a blind user then has no way back in. This listener
+ * catches those escapes and moves focus straight back into the dialog.
+ *
+ * @param getContainer returns the element that bounds the dialog
+ * @param getFocusable returns the focusable controls inside that element
+ * @param isActive     false while another dialog is stacked on top (or this
+ *                     one is closed), so stacked dialogs never fight over focus
+ */
+export function createFocusContainmentListener(args: {
+  getContainer: () => HTMLElement | null;
+  getFocusable: () => HTMLElement[];
+  isActive: () => boolean;
+}): (event: FocusEvent) => void {
+  return (event) => {
+    if (!args.isActive()) return;
+
+    const container = args.getContainer();
+    // Closed or unmounted dialogs hand focus back to their trigger in their
+    // own cleanup, which can run while this listener is still attached.
+    if (!container || !container.isConnected) return;
+
+    const target = event.target;
+    if (target instanceof Node && container.contains(target)) return;
+
+    const focusable = args.getFocusable();
+    const destination = focusable[0];
+    if (destination) {
+      destination.focus();
+      return;
+    }
+    // Nothing to Tab to — park focus on the dialog itself so it stays inside.
+    container.focus();
+  };
 }

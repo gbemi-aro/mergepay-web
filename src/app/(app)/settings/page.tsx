@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ExternalLink, Save, Wallet } from "lucide-react";
+import { ExternalLink, QrCode, Save, Wallet } from "lucide-react";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
@@ -14,12 +14,14 @@ import { useMe, useUpdateMe } from "@/lib/queries";
 import { handleApiError } from "@/lib/errorHandler";
 import { explorerAccountUrl, STELLAR_NETWORK } from "@/lib/constants";
 import { FiatCurrencySelect } from "@/components/FiatCurrencySelect";
+import { ShareAddressModal } from "@/components/ShareAddressModal";
 
 export default function SettingsPage() {
   const { data: me, isError: isMeError, error: meError } = useMe();
   const update = useUpdateMe();
   const [displayName, setDisplayName] = useState("");
   const [avatarUrl, setAvatarUrl] = useState("");
+  const [shareOpen, setShareOpen] = useState(false);
 
   if (isMeError) {
     throw meError || new Error("Failed to load user information");
@@ -115,6 +117,13 @@ export default function SettingsPage() {
                 <CopyButton text={user.stellarPublicKey} what="public key" />
               </div>
             </div>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => setShareOpen(true)}
+            >
+              <QrCode className="h-4 w-4" /> Share address
+            </Button>
             {accountUrl && (
               <a href={accountUrl} target="_blank" rel="noopener noreferrer">
                 <Button variant="outline" className="w-full">
@@ -129,6 +138,13 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
       </div>
+
+      <ShareAddressModal
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        stellarPublicKey={user.stellarPublicKey}
+        displayName={user.displayName}
+      />
     </>
   );
 }

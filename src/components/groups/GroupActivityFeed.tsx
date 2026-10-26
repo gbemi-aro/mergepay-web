@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { AssetBadge } from "@/components/asset-badge";
 import { Money } from "@/components/amount";
 import { EmptyState } from "@/components/ui/empty-state";
-import { ListSkeleton } from "@/components/ui/skeleton";
+import { ListSkeleton, ActivityFeedSkeleton } from "@/components/ui/skeleton";
 import { SectionBoundary, SectionError, SectionLoading } from "@/components/ui/section";
 import { ExpenseFilterBar, type ActivityFilters } from "@/components/expenses/ExpenseFilterBar";
 import {
@@ -238,7 +238,7 @@ export function GroupActivityFeed({
       <div className={className}>
         {isLoading && (
           <SectionLoading label="Loading group activity feed" minHeight="min-h-[16rem]">
-            <ListSkeleton rows={4} />
+            <ActivityFeedSkeleton rows={4} />
           </SectionLoading>
         )}
 
@@ -272,6 +272,7 @@ export function GroupActivityFeed({
 function ActivityItem({ event }: { event: GroupActivityEvent }) {
   const config = getActivityConfig(event.type);
   const isOptimistic = Boolean(event.isOptimistic);
+  const isPending = ["pending", "submitted", "settling"].includes(event.status ?? "");
 
   return (
     <li
@@ -302,7 +303,14 @@ function ActivityItem({ event }: { event: GroupActivityEvent }) {
               {config.label}
             </Badge>
 
-            {isOptimistic && (
+            {isPending && (
+              <Badge tone="butter" className="text-[10px] px-2 py-0.5">
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                Pending confirmation
+              </Badge>
+            )}
+
+            {isOptimistic && !isPending && (
               <Badge tone="tangerine" className="text-[10px] px-2 py-0.5 animate-spin-slow">
                 <Loader2 className="h-3 w-3 mr-1 animate-spin" />
                 Syncing...

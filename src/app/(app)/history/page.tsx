@@ -1,9 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
-  Download,
   FileDown,
   History as HistoryIcon,
   Receipt,
@@ -22,27 +21,36 @@ import { SettlementStatusDetail } from "@/components/settle/settlement-status";
 import { Tabs } from "@/components/ui/tabs";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ListSkeleton } from "@/components/ui/skeleton";
+import { ExpenseListSkeleton } from "@/components/expenses/ExpenseListSkeleton";
 import { useInfiniteHistory, accumulateHistoryPages } from "@/lib/queries";
 import {
   toHistoryRow,
   matchesHistoryFilters,
   hasActiveFilters,
+  sortHistoryRows,
   type HistoryFilters,
 } from "@/lib/historyFilter";
 import { printReceipt } from "@/lib/export";
-import { exportTransactionHistoryCsv } from "@/lib/utils/transactionHistoryCsv";
-import { AuditDetails, GroupExportButton } from "@/components/GroupHistoryExport";
+import {
+  DEFAULT_HISTORY_VIEW,
+  readHistoryView,
+  writeHistoryView,
+  type HistoryKind,
+} from "@/lib/history-view";
+import { AuditDetails } from "@/components/GroupHistoryExport";
+import { GroupExportMenu } from "@/components/groups/GroupExportMenu";
 import { Timestamp } from "@/components/timestamp";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 import { Pagination } from "@/components/ui/pagination";
 
-type Filter = "all" | "expenses" | "settlements";
+type Filter = HistoryKind;
 const HISTORY_PAGE_SIZE = 10;
 
 export default function HistoryPage() {
   const {
     data: pages,
-    isLoading,
+    isPending,
     isError,
     isFetching,
     isFetchingNextPage,
@@ -51,9 +59,27 @@ export default function HistoryPage() {
     refetch,
   } = useInfiniteHistory();
 
-  const [filter, setFilter] = useState<Filter>("all");
-  const [filters, setFilters] = useState<HistoryFilters>({ kind: "all" });
+  const [filter, setFilter] = useState<Filter>(DEFAULT_HISTORY_VIEW.kind);
+  const [filters, setFilters] = useState<HistoryFilters>(
+    DEFAULT_HISTORY_VIEW.filters
+  );
   const [currentPage, setCurrentPage] = useState(1);
+  // The tab and the filter bar are display preferences: they are restored
+  // after mount (so server and first client render match) and written back
+  // on every change (#494).
+  const [restored, setRestored] = useState(false);
+
+  useEffect(() => {
+    const stored = readHistoryView();
+    setFilter(stored.kind);
+    setFilters(stored.filters);
+    setRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!restored) return;
+    writeHistoryView({ kind: filter, filters });
+  }, [restored, filter, filters]);
 
   // Accumulate all loaded pages into a single deduplicated set sorted
   // newest-first — mergeHistoryPages keeps stable order across refetches.
@@ -71,11 +97,10 @@ export default function HistoryPage() {
     if (filter === "settlements") {
       return settlements.map((s) => ({ type: "settlement" as const, item: s, date: s.createdAt }));
     }
-    const combined = [
+    return sortHistoryRows([
       ...expenses.map((e) => ({ type: "expense" as const, item: e, date: e.createdAt })),
       ...settlements.map((s) => ({ type: "settlement" as const, item: s, date: s.createdAt })),
-    ];
-    return combined.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    ]);
   }, [filter, expenses, settlements]);
 
   // Apply the search bar filters (keyword, currency, person, date range).
@@ -111,7 +136,7 @@ export default function HistoryPage() {
   }
 
   return (
-    <>
+    <ErrorBoundary onReset={() => void refetch()}>
       <PageHeader
         title="History"
         description="Every expense and on-chain settlement you're part of, with verifiable transaction hashes."
@@ -126,13 +151,16 @@ export default function HistoryPage() {
               >
                 <RefreshCcw className="h-4 w-4" /> Refresh
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => exportTransactionHistoryCsv(expenses, settlements)}
-              >
-                <Download className="h-4 w-4" /> Export CSV
-              </Button>
-              <GroupExportButton expenses={expenses} settlements={settlements} />
+              {/* One dropdown for both formats instead of the three
+                  overlapping export buttons this header used to render
+                  (#362). Files are timestamped so repeat exports never
+                  overwrite each other. */}
+              <GroupExportMenu
+                groupId="all"
+                expenses={expenses}
+                settlements={settlements}
+                menuLabel="Export transaction history"
+              />
             </div>
           )
         }
@@ -151,8 +179,8 @@ export default function HistoryPage() {
 
       {hasData && <HistoryFilterBar value={filters} onChange={setFilters} />}
 
-      {isLoading ? (
-        <ListSkeleton rows={5} />
+      {isPending ? (
+        <ExpenseListSkeleton count={5} />
       ) : isError ? (
         <EmptyState
           icon={<HistoryIcon className="h-7 w-7 text-red-500" />}
@@ -197,6 +225,11 @@ export default function HistoryPage() {
                       <p className="truncate font-bold">{e.title}</p>
                       <p className="text-xs text-ink/50">
                         {e.payer.displayName} paid · <Timestamp value={e.createdAt} />
+                        {e.memo && (
+                          <span className="ml-1.5 inline-block font-mono text-[11px] text-ink/70">
+                            · Memo: {e.memo}
+                          </span>
+                        )}
                       </p>
                     </div>
                     <div className="text-right">
@@ -226,6 +259,11 @@ export default function HistoryPage() {
                       <Avatar user={s.to} size="sm" />
                       <span className="text-sm font-bold">{s.to.displayName}</span>
                     </div>
+                    {s.memo && (
+                      <p className="mt-1 font-mono text-xs text-ink/70">
+                        Memo: {s.memo}
+                      </p>
+                    )}
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-2">
                     <Money value={s.amount} assetCode={s.assetCode} />
@@ -272,6 +310,6 @@ export default function HistoryPage() {
           )}
         </div>
       )}
-    </>
+    </ErrorBoundary>
   );
 }

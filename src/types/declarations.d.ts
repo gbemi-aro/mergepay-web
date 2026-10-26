@@ -17,6 +17,18 @@ declare module "@stellar/freighter-api" {
 }
 
 declare module "@stellar/stellar-sdk" {
+  export namespace Horizon {
+    class Server {
+      constructor(serverURL: string, opts?: { allowHttp?: boolean });
+      loadAccount(accountId: string): Promise<{
+        balances: Array<{
+          asset_type: string;
+          asset_code?: string;
+          asset_issuer?: string;
+        }>;
+      }>;
+    }
+  }
   export class Asset {
     constructor(code: string, issuer?: string);
     static native(): Asset;
@@ -35,6 +47,11 @@ declare module "@stellar/stellar-sdk" {
   }
   export class Account {
     constructor(accountId: string, sequence: string);
+  }
+  export class Memo {
+    static text(value: string): Memo;
+    type: string;
+    value: string;
   }
 }
 
