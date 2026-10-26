@@ -66,8 +66,10 @@ describe("TrustlineVerificationBanner", () => {
 
     await waitFor(() => {
       expect(fetchHorizonAccountBalances).toHaveBeenCalled();
+      // The banner renders while balances are unknown, then clears once the
+      // fetched balances show every required trustline in place.
+      expect(container.querySelector('[role="alert"]')).toBeNull();
     });
-    expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 
   it("renders an alert banner listing missing trustline assets", async () => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { useAuth, getPersistedSession } from "../lib/auth-store";
 import { useWalletStore } from "../lib/wallet-store";
 import { getAddress, isConnected } from "@stellar/freighter-api";
@@ -67,5 +67,11 @@ export function useSessionRestore() {
     void restore();
   }, [restoreStatus, forgetWallet, setRestoreStatus]);
 
-  return { restoreSession: () => setRestoreStatus("idle") };
+  // Stable identity: the app layout puts this in a `useEffect` dependency
+  // array, so a fresh closure per render would re-run that effect on every
+  // render — each pass scheduling another store update and looping until
+  // React throws "Maximum update depth exceeded".
+  const restoreSession = useCallback(() => setRestoreStatus("idle"), [setRestoreStatus]);
+
+  return { restoreSession };
 }

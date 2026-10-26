@@ -34,7 +34,9 @@ vi.mock("@/lib/api", async () => {
   };
 });
 
-const { api } = vi.mocked(await import("@/lib/api"));
+// `deep: true` — the mocked functions live one level down, on `api`, not on
+// the module namespace itself.
+const { api } = vi.mocked(await import("@/lib/api"), true);
 
 function createWrapper() {
   const queryClient = new QueryClient({
