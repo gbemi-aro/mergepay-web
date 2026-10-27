@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Dialog } from "@/components/ui/dialog";
@@ -25,7 +25,20 @@ export function CreateGroupDialog({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const isOffline = typeof navigator !== "undefined" && !navigator.onLine;
+  // Connectivity belongs in an effect: `navigator.onLine` read during render
+  // diverges from the SSR HTML (Node ≥21 exposes a global `navigator` whose
+  // `onLine` is undefined) and breaks React hydration.
+  const [isOffline, setIsOffline] = useState(false);
+  useEffect(() => {
+    const update = () => setIsOffline(!navigator.onLine);
+    update();
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
 
   function nameError(): string | undefined {
     return errors.name;

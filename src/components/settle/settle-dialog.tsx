@@ -231,8 +231,20 @@ export function SettleDialog({
   const { refresh: refreshWallet, ...wallet } = useWalletStatus();
   // Signing requires the wallet — block new attempts while disconnected.
   const walletDisconnected = useWalletDisconnected();
-  // Prevent on-chain submissions when the browser is offline.
-  const isOffline = typeof navigator !== "undefined" && !navigator.onLine;
+  // Connectivity belongs in an effect: `navigator.onLine` read during render
+  // diverges from the SSR HTML (Node ≥21 exposes a global `navigator` whose
+  // `onLine` is undefined) and can break React hydration.
+  const [isOffline, setIsOffline] = useState(false);
+  useEffect(() => {
+    const update = () => setIsOffline(!navigator.onLine);
+    update();
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, []);
 
   const isBulk = !!bulkTarget;
   const active = isBulk ? bulkTarget : target;
