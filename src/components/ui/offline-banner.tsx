@@ -15,9 +15,13 @@ export interface OfflineBannerProps {
  * fires an 'offline' window event, and dismisses smoothly on reconnection.
  */
 export function OfflineBanner({ className }: OfflineBannerProps) {
-  const [isOnline, setIsOnline] = useState<boolean>(() => {
-    return typeof navigator !== "undefined" ? navigator.onLine : true;
-  });
+  // Start "online" so the first client render of the SSR HTML is identical;
+  // reading `navigator.onLine` synchronously in the initializer instead makes
+  // the constructor diverge from the server (Node ≥21 exposes a bare global
+  // `navigator` whose `onLine` is undefined, i.e. falsy "offline"), which
+  // throws React hydration error #418/#423 on every page and replaces the
+  // whole document with client content.
+  const [isOnline, setIsOnline] = useState(true);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

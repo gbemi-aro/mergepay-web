@@ -18,7 +18,12 @@ export interface NetworkHealthState {
  */
 export function useNetworkStatus(): NetworkHealthState {
   const [status, setStatus] = useState<NetworkHealthState>({
-    isOnline: typeof navigator !== "undefined" ? navigator.onLine : true,
+    // Same first render as the SSR output: never read `navigator.onLine` in
+    // the initializer. Node ≥21 has a global `navigator` without `onLine`, so
+    // a server pass through that read reports "offline" while the browser
+    // reports online — an instant React hydration mismatch. The effect below
+    // immediately applies the real connectivity state.
+    isOnline: true,
     isApiDegraded: false,
     latencyMs: null,
     lastChecked: Date.now(),

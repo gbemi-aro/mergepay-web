@@ -75,4 +75,18 @@ describe("AssetSelector", () => {
     fireEvent.blur(screen.getByRole("combobox"));
     expect(onBlur).toHaveBeenCalled();
   });
+
+  it("reports an unavailable preview for non-numeric amounts", () => {
+    renderSelector({ cryptoAmount: "abc" });
+
+    expect(screen.getByTestId("asset-equivalent")).toHaveTextContent(
+      "Fiat preview unavailable."
+    );
+  });
+
+  it("labels the selected asset with its transition name when provided", () => {
+    renderSelector({ name: () => "Lumen" });
+
+    expect(screen.getByRole("combobox")).toHaveTextContent("XLM (Lumen)");
+  });
 });
